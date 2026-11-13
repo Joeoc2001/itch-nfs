@@ -90,6 +90,20 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind {}", args.listen))?;
     tracing::info!("serving NFSv3 on {}", args.listen);
     tokio::spawn(async move { fs.run_maintenance().await });
-    listener.handle_forever().await?;
+    tokio::select! {
+        served = listener.handle_forever() => served?,
+        _ = shutdown_signal() => tracing::info!("shutting down"),
+    }
     Ok(())
+}
+
+/// Ctrl-C or SIGTERM. Handled explicitly because, as PID 1 in a container,
+/// the process would otherwise ignore SIGTERM and `docker stop` would hang.
+async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
 }

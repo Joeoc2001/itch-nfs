@@ -48,8 +48,26 @@ cargo build --release
 ITCH_TOKEN=... ./target/release/itch-nfs --state-dir /var/lib/itch-nfs
 ```
 
-The token is an itch.io OAuth access token or an API key
-(<https://itch.io/user/settings/api-keys>).
+The token is an itch.io API key (<https://itch.io/user/settings/api-keys>).
+
+### Docker
+
+Every merge to `main` that passes CI publishes `ghcr.io/joeoc2001/itch-nfs`
+(`latest`, and `sha-<commit>` for pinning; linux/amd64).
+
+```sh
+docker run -d --name itch-nfs --restart unless-stopped \
+  -e ITCH_TOKEN=... \
+  -p 11111:11111 \
+  -v itch-nfs-data:/data \
+  -v itch-nfs-cache:/cache \
+  ghcr.io/joeoc2001/itch-nfs
+```
+
+`/data` is `--state-dir` and must be kept. `/cache` is `--archive-dir`; keeping
+it avoids re-downloading, and is what lets old versions outlive their upload.
+The server runs as uid 10001, so bind-mounted host directories must be writable
+by that uid. All flags below work as arguments or environment variables.
 
 | Flag | Environment | Default | |
 |---|---|---|---|
@@ -119,5 +137,8 @@ with the Linux kernel NFS client and checks the mount with `ci/validate.py`:
   is writable. Set the repository variable `ITCH_NFS_CI_PACK` to a pack
   directory name to pin which pack is used. Pack names are kept out of the
   logs unless the variable `ITCH_NFS_CI_SHOW_NAMES` is `1`.
+
+The Docker image is built on every run, and must serve the mock fixture pack
+through a kernel mount before it is pushed.
 
 To run the same check by hand: `ITCH_TOKEN=... ci/mount-and-validate.sh`.
