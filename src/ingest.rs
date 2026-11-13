@@ -231,11 +231,22 @@ pub fn ingest(
     };
     if format == Format::Zip {
         match ZipArchive::new(BufReader::new(File::open(src)?)) {
-            Ok(zip)
+            Ok(mut zip)
                 if !zip
                     .file_names()
                     .any(|n| n.is_ok_and(|n| is_archive_name(&n))) =>
             {
+                // Served as it is, so check the archive-bomb limit here. The
+                // zip crate never decompresses an entry past its declared size.
+                let mut total = 0u64;
+                for i in 0..zip.len() {
+                    total = total.saturating_add(zip.by_index_raw(i)?.size());
+                }
+                if total > limits.max_unpacked_bytes {
+                    bail!(
+                        "unpack {filename}: upload decompresses to more than the configured limit"
+                    );
+                }
                 return Ok(Outcome::ZipAsIs);
             }
             Ok(_) => {}

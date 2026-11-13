@@ -34,7 +34,7 @@ def warn(message):
 
 
 def files_under(root):
-    for base, dirs, names in os.walk(root, onerror=lambda e: fail(f"cannot list {e.filename}: {e.strerror}")):
+    for base, dirs, names in os.walk(root, onerror=lambda e: fail(f"cannot list {os.path.relpath(e.filename, root)} under a version: {e.strerror}")):
         dirs.sort()
         for name in sorted(names):
             yield os.path.join(base, name)

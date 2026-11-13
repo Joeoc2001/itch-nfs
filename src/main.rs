@@ -76,9 +76,10 @@ async fn main() -> Result<()> {
 
     let cfg = Config {
         state_dir: args.state_dir,
-        archive_dir: args
-            .archive_dir
-            .unwrap_or_else(|| std::env::temp_dir().join("itch-nfs")),
+        archive_dir: match args.archive_dir {
+            Some(dir) => dir,
+            None => private_temp_dir()?,
+        },
         cache_max_bytes: args.cache_max_mb * 1024 * 1024,
         cache_ttl: Duration::from_secs(args.cache_ttl),
         refresh_interval: Duration::from_secs(args.refresh_interval),
@@ -95,6 +96,36 @@ async fn main() -> Result<()> {
         _ = shutdown_signal() => tracing::info!("shutting down"),
     }
     Ok(())
+}
+
+/// The default `--archive-dir`, `<temp dir>/itch-nfs`. The temp dir is shared
+/// with other users, who could otherwise create this directory first (or make
+/// it a symlink) and so plant archives that get served, or have the server
+/// overwrite files of its choosing. So it must be a real directory, owned by
+/// us and closed to everyone else.
+fn private_temp_dir() -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let dir = std::env::temp_dir().join("itch-nfs");
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
+    }
+    let meta =
+        std::fs::symlink_metadata(&dir).with_context(|| format!("stat {}", dir.display()))?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !meta.is_dir() || meta.uid() != euid {
+        bail!(
+            "{} is not a directory owned by this user; pass --archive-dir",
+            dir.display()
+        );
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod {}", dir.display()))?;
+    }
+    Ok(dir)
 }
 
 /// Ctrl-C or SIGTERM. Handled explicitly because, as PID 1 in a container,
