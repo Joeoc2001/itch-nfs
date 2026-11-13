@@ -10,6 +10,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege for the GITHUB_TOKEN; the docker job asks for more itself.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

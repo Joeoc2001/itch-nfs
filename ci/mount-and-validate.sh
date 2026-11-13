@@ -19,14 +19,36 @@ mkdir -p "$mnt"
 "$bin" --listen "127.0.0.1:$port" --state-dir "$work/state" --archive-dir "$work/archives" >"$log" 2>&1 &
 server=$!
 
+# Replace every pack directory name the server recorded, and every itch.io
+# URL, with a placeholder.
+redact() {
+    python3 -c '
+import json, re, sys
+try:
+    with open(sys.argv[1]) as f:
+        names = [g["name"] for g in json.load(f)["games"].values()]
+except (OSError, ValueError, KeyError):
+    names = []
+names.sort(key=len, reverse=True)
+pattern = re.compile("|".join([r"https?://\S+"] + [re.escape(n) for n in names if n]))
+for line in sys.stdin:
+    line = pattern.sub("<redacted>", line)
+    # Without state.json the names are unknown: drop the lines that carry them.
+    if not names and re.search(r"new pack: |new version: |could not list uploads of |has too many versions", line):
+        continue
+    sys.stdout.write(line)
+' "$work/state/state.json"
+}
+
 cleanup() {
     status=$?
     sudo umount -f "$mnt" 2>/dev/null || true
     kill "$server" 2>/dev/null || true
     if [ "$status" -ne 0 ]; then
         echo "::group::server log"
-        # "new pack" lines would list the token owner's whole library.
-        if [ "${SHOW_NAMES:-}" = 1 ]; then cat "$log"; else grep -v "new pack: " "$log" || true; fi
+        # Pack names and URLs (in "new pack", "new version" and warning lines)
+        # would list the token owner's library, so they are redacted.
+        if [ "${SHOW_NAMES:-}" = 1 ]; then cat "$log"; else redact <"$log"; fi
         echo "::endgroup::"
     fi
     exit "$status"

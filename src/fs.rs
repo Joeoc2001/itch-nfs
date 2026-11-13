@@ -34,6 +34,11 @@ pub struct Config {
 /// How many archives-within-archives are unpacked.
 const MAX_ARCHIVE_DEPTH: u32 = 8;
 
+/// Largest READ served at once, matching the `rtmax` nfsserve advertises.
+/// Clients may ask for more, and the export is unauthenticated, so without a
+/// cap one request could make the server allocate up to 4 GiB.
+const MAX_READ: u32 = 1024 * 1024;
+
 const ERROR_BACKOFF: Duration = Duration::from_secs(30);
 
 /// File ids: 20 bits pack number, 16 bits version number, 28 bits tree node.
@@ -785,6 +790,7 @@ impl NFSFileSystem for ItchFs {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         };
         let (size, crc) = (*size, *crc);
+        let count = count.min(MAX_READ);
         let slice = |b: &Bytes| {
             let start = offset.min(b.len() as u64) as usize;
             let end = (offset.saturating_add(count as u64)).min(b.len() as u64) as usize;

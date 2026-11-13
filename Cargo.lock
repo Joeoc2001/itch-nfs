@@ -964,6 +964,7 @@ dependencies = [
  "crc32fast",
  "flate2",
  "futures-util",
+ "libc",
  "lzma-rust2",
  "nfs3_client",
  "nfsserve",
