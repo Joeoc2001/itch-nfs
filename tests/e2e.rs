@@ -41,6 +41,7 @@ async fn serve(mock_addr: SocketAddr, state_dir: &Path, archive_dir: &Path) -> (
     tokio::spawn(async move { listener.handle_forever().await });
     let conn = Nfs3ConnectionBuilder::new(TokioConnector, "127.0.0.1", "/")
         .portmapper_port(port)
+        .connect_from_privileged_port(false)
         .mount()
         .await
         .unwrap();

@@ -42,6 +42,7 @@ jobs:
           SHOW_NAMES: 1
         run: |
           target/release/examples/mock_itch 127.0.0.1:8099 &
+          timeout 10 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/8099) 2>/dev/null; do sleep 0.1; done'
           ci/mount-and-validate.sh --all --expect ci/mock-expected.txt
 
   mount-live:

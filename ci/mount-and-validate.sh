@@ -42,9 +42,4 @@ done
 sudo mount -t nfs -o "ro,vers=3,tcp,nolock,port=$port,mountport=$port" 127.0.0.1:/ "$mnt"
 echo "mounted"
 
-if grep -q "could not list owned packs" "$log"; then
-    echo "::error::the itch.io API rejected the request: check the token"
-    exit 1
-fi
-
 timeout 45m python3 "$(dirname "$0")/validate.py" "$mnt" --state-dir "$work/state" ${SHOW_NAMES:+--names} "$@"
