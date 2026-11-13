@@ -12,7 +12,7 @@ use zip::ZipArchive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
-    /// A zip archive, exposed as its decompressed contents.
+    /// An archive (flattened to a zip if need be), exposed as its contents.
     Zip,
     /// Anything else, exposed as the single downloaded file.
     Raw,
@@ -38,72 +38,70 @@ pub struct Entry {
     pub index: usize,
 }
 
-/// Build the manifest of a downloaded upload.
-pub fn scan(path: &Path, filename: &str) -> Result<Manifest> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    match ZipArchive::new(file) {
-        Ok(mut zip) => {
-            let mut entries = Vec::with_capacity(zip.len());
-            for index in 0..zip.len() {
-                let f = zip.by_index_raw(index)?;
-                if f.is_dir() || f.is_symlink() {
-                    continue;
-                }
-                let Some(path) = f.enclosed_name().and_then(|p| normalise(&p)) else {
-                    tracing::warn!("skipping zip entry with unsafe name {:?}", f.name());
-                    continue;
-                };
-                if is_junk(&path) {
-                    continue;
-                }
-                let mtime = f.last_modified().and_then(zip_time).unwrap_or(0);
-                entries.push(Entry {
-                    path,
-                    size: f.size(),
-                    crc: f.crc32(),
-                    mtime,
-                    index,
-                });
+/// Build the manifest of an ingested upload: `zip` says whether the cached
+/// file is a (possibly flattened) zip, or the upload served as it is.
+pub fn scan(path: &Path, filename: &str, zip: bool) -> Result<Manifest> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    if zip {
+        let mut zip =
+            ZipArchive::new(file).with_context(|| format!("read zip {}", path.display()))?;
+        let mut entries = Vec::with_capacity(zip.len());
+        for index in 0..zip.len() {
+            let f = zip.by_index_raw(index)?;
+            if f.is_dir() || f.is_symlink() {
+                continue;
             }
-            Ok(Manifest {
-                kind: Kind::Zip,
-                entries,
-            })
-        }
-        Err(_) => {
-            let mut file = File::open(path)?;
-            let mut hasher = crc32fast::Hasher::new();
-            let mut buf = vec![0u8; 1 << 16];
-            let mut size = 0u64;
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                size += n as u64;
-            }
-            let name = filename.replace(['/', '\\'], "_");
-            let name = if name.is_empty() || name == "." || name == ".." {
-                "upload.bin".to_string()
-            } else {
-                name
+            let Some(path) = f.enclosed_name().and_then(|p| normalise(&p)) else {
+                tracing::warn!("skipping zip entry with unsafe name {:?}", f.name());
+                continue;
             };
-            Ok(Manifest {
-                kind: Kind::Raw,
-                entries: vec![Entry {
-                    path: name,
-                    size,
-                    crc: hasher.finalize(),
-                    mtime: 0,
-                    index: 0,
-                }],
-            })
+            if is_junk(&path) {
+                continue;
+            }
+            let mtime = f.last_modified().and_then(zip_time).unwrap_or(0);
+            entries.push(Entry {
+                path,
+                size: f.size(),
+                crc: f.crc32(),
+                mtime,
+                index,
+            });
         }
+        return Ok(Manifest {
+            kind: Kind::Zip,
+            entries,
+        });
     }
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut size = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    let name = filename.replace(['/', '\\'], "_");
+    let name = if name.is_empty() || name == "." || name == ".." {
+        "upload.bin".to_string()
+    } else {
+        name
+    };
+    Ok(Manifest {
+        kind: Kind::Raw,
+        entries: vec![Entry {
+            path: name,
+            size,
+            crc: hasher.finalize(),
+            mtime: 0,
+            index: 0,
+        }],
+    })
 }
 
-fn normalise(p: &Path) -> Option<String> {
+pub(crate) fn normalise(p: &Path) -> Option<String> {
     let mut parts = Vec::new();
     for c in p.components() {
         match c {
@@ -120,11 +118,14 @@ fn normalise(p: &Path) -> Option<String> {
 }
 
 /// macOS Finder litter that is never a real asset.
-fn is_junk(path: &str) -> bool {
+pub(crate) fn is_junk(path: &str) -> bool {
     path.split('/').any(|c| c == "__MACOSX" || c == ".DS_Store")
 }
 
-fn zip_time(t: zip::DateTime) -> Option<i64> {
+pub(crate) fn zip_time(t: zip::DateTime) -> Option<i64> {
+    if t == zip::DateTime::default() {
+        return None; // 1980-01-01: the writer did not know
+    }
     let d = chrono::NaiveDate::from_ymd_opt(t.year() as i32, t.month() as u32, t.day() as u32)?;
     Some(
         d.and_hms_opt(t.hour() as u32, t.minute() as u32, t.second() as u32)?
@@ -181,6 +182,7 @@ impl Archives {
         path: &Path,
         index: usize,
         size: u64,
+        crc: u32,
         out: &mut dyn std::io::Write,
     ) -> Result<()> {
         let h = self.handle(key, path)?;
@@ -188,6 +190,12 @@ impl Archives {
         let mut f = zip
             .by_index(index)
             .with_context(|| format!("zip entry {index} of {}", path.display()))?;
+        if f.crc32() != crc {
+            bail!(
+                "zip entry {index} of {} is not the file that was listed",
+                path.display()
+            );
+        }
         let n = std::io::copy(&mut f, out)
             .with_context(|| format!("decompress entry {index} of {}", path.display()))?;
         if n != size {

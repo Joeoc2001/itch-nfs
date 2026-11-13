@@ -37,6 +37,7 @@ pub enum NodeKind {
     },
     File {
         size: u64,
+        crc: u32,
         mtime: i64,
         source: Source,
     },
@@ -110,6 +111,7 @@ impl Tree {
                     part,
                     NodeKind::File {
                         size: e.size,
+                        crc: e.crc,
                         mtime: e.mtime,
                         source,
                     },
@@ -134,6 +136,7 @@ impl Tree {
                 DEDUP_FILE,
                 NodeKind::File {
                     size: dedup.len() as u64,
+                    crc: 0,
                     mtime: 0,
                     source,
                 },

@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 use crate::archive::{self, Archives, Manifest};
 use crate::cache::{KeyedLocks, MemCache};
+use crate::ingest::{self, Limits, Outcome};
 use crate::itch::{ItchClient, Upload};
 use crate::state::{self, GameState, State, VersionState};
 use crate::tree::{NodeKind, Seen, Source, Tree};
@@ -26,7 +27,12 @@ pub struct Config {
     pub cache_max_bytes: u64,
     pub cache_ttl: Duration,
     pub refresh_interval: Duration,
+    /// Cap on the decompressed size of a single upload.
+    pub max_unpacked_bytes: u64,
 }
+
+/// How many archives-within-archives are unpacked.
+const MAX_ARCHIVE_DEPTH: u32 = 8;
 
 const ERROR_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -158,9 +164,11 @@ impl ItchFs {
         std::fs::create_dir_all(cfg.state_dir.join("manifests"))
             .with_context(|| format!("create {}", cfg.state_dir.display()))?;
         // Extracted oversized files are only valid for this process.
-        let spill = cfg.archive_dir.join("spill");
-        let _ = std::fs::remove_dir_all(&spill);
-        std::fs::create_dir_all(&spill).with_context(|| format!("create {}", spill.display()))?;
+        for scratch in ["spill", "tmp"] {
+            let dir = cfg.archive_dir.join(scratch);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        }
         let state = State::load(&cfg.state_dir)?;
         let mem = MemCache::new(cfg.cache_max_bytes, cfg.cache_ttl);
         Ok(ItchFs(Arc::new(Inner {
@@ -383,20 +391,28 @@ impl ItchFs {
         Ok((g.game_id, v.clone()))
     }
 
-    fn archive_path(&self, game_id: u64, ver: u16) -> PathBuf {
-        self.0.cfg.archive_dir.join(format!("{game_id}-{ver}.bin"))
+    /// Where a version's archive lives in the disk cache: `.zip` if it is
+    /// served as a zip (as uploaded, or flattened), `.raw` if served whole.
+    fn archive_path(&self, game_id: u64, ver: u16, zip: bool) -> PathBuf {
+        self.0.cfg.archive_dir.join(format!(
+            "{game_id}-{ver}.{}",
+            if zip { "zip" } else { "raw" }
+        ))
     }
 
-    /// Make sure the version's archive is in the disk cache, downloading it if needed.
-    async fn ensure_archive(&self, no: u32, ver: u16) -> Result<PathBuf> {
+    /// Make sure the version's archive is in the disk cache, downloading and
+    /// unpacking it if needed. Returns its path and whether it is a zip.
+    async fn ensure_archive(&self, no: u32, ver: u16) -> Result<(PathBuf, bool)> {
         let (game_id, v) = self
             .version(no, ver)
             .map_err(|_| anyhow!("unknown version"))?;
-        let path = self.archive_path(game_id, ver);
         let key = Id::Version(no, ver).encode();
         let _guard = self.0.locks.lock(key).await;
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            return Ok(path);
+        for zip in [true, false] {
+            let path = self.archive_path(game_id, ver, zip);
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                return Ok((path, zip));
+            }
         }
         // An upload id can be re-used for new content, so only download if itch
         // still serves exactly this version.
@@ -435,21 +451,45 @@ impl ItchFs {
             v.name,
             v.size.map_or("?".into(), |s| s.to_string())
         );
-        let part = path.with_extension("part");
-        let written = self.0.client.download(v.upload_id, key_id, &part).await;
-        let check = written.and_then(|n| match v.size {
-            Some(size) if v.build_id.is_none() && size != n => {
-                Err(anyhow!("{}: downloaded {n} bytes, expected {size}", v.name))
+        let part = self.0.cfg.archive_dir.join(format!("{game_id}-{ver}.part"));
+        let flat = self.0.cfg.archive_dir.join(format!("{game_id}-{ver}.flat"));
+        let result = async {
+            let n = self.0.client.download(v.upload_id, key_id, &part).await?;
+            if let Some(size) = v.size
+                && v.build_id.is_none()
+                && size != n
+            {
+                bail!("{}: downloaded {n} bytes, expected {size}", v.name);
             }
-            _ => Ok(()),
-        });
-        if let Err(e) = check {
-            let _ = tokio::fs::remove_file(&part).await;
-            return Err(e);
+            let limits = Limits {
+                max_unpacked_bytes: self.0.cfg.max_unpacked_bytes,
+                max_depth: MAX_ARCHIVE_DEPTH,
+            };
+            let (src, out, tmp, filename) = (
+                part.clone(),
+                flat.clone(),
+                self.0.cfg.archive_dir.join("tmp"),
+                v.filename.clone(),
+            );
+            let outcome = tokio::task::spawn_blocking(move || {
+                ingest::ingest(&src, &filename, &out, &tmp, limits)
+            })
+            .await??;
+            self.0.archives.forget(key);
+            let (from, zip) = match outcome {
+                Outcome::ZipAsIs => (&part, true),
+                Outcome::Flattened => (&flat, true),
+                Outcome::Raw => (&part, false),
+            };
+            let path = self.archive_path(game_id, ver, zip);
+            tokio::fs::rename(from, &path).await?;
+            Ok((path, zip))
         }
-        self.0.archives.forget(key);
-        tokio::fs::rename(&part, &path).await?;
-        Ok(path)
+        .await;
+        // Whichever of the two was not promoted is scrap.
+        let _ = tokio::fs::remove_file(&part).await;
+        let _ = tokio::fs::remove_file(&flat).await;
+        result
     }
 
     async fn manifest(&self, no: u32, ver: u16) -> Result<Manifest> {
@@ -468,9 +508,10 @@ impl ItchFs {
                 Err(e) => warn!("ignoring corrupt {}: {e}", path.display()),
             }
         }
-        let archive = self.ensure_archive(no, ver).await?;
+        let (archive, zip) = self.ensure_archive(no, ver).await?;
         let manifest =
-            tokio::task::spawn_blocking(move || archive::scan(&archive, &v.filename)).await??;
+            tokio::task::spawn_blocking(move || archive::scan(&archive, &v.filename, zip))
+                .await??;
         state::write_atomic(&path, &serde_json::to_vec(&manifest)?)?;
         Ok(manifest)
     }
@@ -495,6 +536,16 @@ impl ItchFs {
         }
     }
 
+    async fn zip_archive(&self, no: u32, ver: u16) -> Result<PathBuf> {
+        match self.ensure_archive(no, ver).await? {
+            (path, true) => Ok(path),
+            (path, false) => bail!(
+                "{} could not be unpacked the way it was when it was first listed",
+                path.display()
+            ),
+        }
+    }
+
     /// Decompressed contents of a zip entry, via the in-memory cache.
     async fn file_bytes(
         &self,
@@ -503,6 +554,7 @@ impl ItchFs {
         ver: u16,
         index: usize,
         size: u64,
+        crc: u32,
     ) -> Result<Bytes> {
         if let Some(b) = self.0.mem.get(&id) {
             return Ok(b);
@@ -511,13 +563,13 @@ impl ItchFs {
         if let Some(b) = self.0.mem.get(&id) {
             return Ok(b);
         }
-        let path = self.ensure_archive(no, ver).await?;
+        let path = self.zip_archive(no, ver).await?;
         let archives = self.0.archives.clone();
         let key = Id::Version(no, ver).encode();
         let data = tokio::task::spawn_blocking(move || {
             let mut buf = Vec::with_capacity(size as usize);
             archives
-                .extract(key, &path, index, size, &mut buf)
+                .extract(key, &path, index, size, crc, &mut buf)
                 .map(|_| buf)
         })
         .await??;
@@ -527,7 +579,15 @@ impl ItchFs {
     }
 
     /// Files too big for the memory cache are extracted to disk instead.
-    async fn spill(&self, id: u64, no: u32, ver: u16, index: usize, size: u64) -> Result<PathBuf> {
+    async fn spill(
+        &self,
+        id: u64,
+        no: u32,
+        ver: u16,
+        index: usize,
+        size: u64,
+        crc: u32,
+    ) -> Result<PathBuf> {
         let dest = self
             .0
             .cfg
@@ -538,14 +598,14 @@ impl ItchFs {
         if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
             return Ok(dest);
         }
-        let path = self.ensure_archive(no, ver).await?;
+        let path = self.zip_archive(no, ver).await?;
         let archives = self.0.archives.clone();
         let key = Id::Version(no, ver).encode();
         let out = dest.clone();
         tokio::task::spawn_blocking(move || {
             let part = out.with_extension("part");
             let mut file = std::io::BufWriter::new(std::fs::File::create(&part)?);
-            archives.extract(key, &path, index, size, &mut file)?;
+            archives.extract(key, &path, index, size, crc, &mut file)?;
             file.into_inner().map_err(|e| e.into_error())?;
             std::fs::rename(&part, &out)?;
             anyhow::Ok(())
@@ -718,10 +778,13 @@ impl NFSFileSystem for ItchFs {
         self.version(no, ver)?;
         let tree = self.tree(no, ver).await?;
         let node = tree.get(n).ok_or(nfsstat3::NFS3ERR_STALE)?;
-        let NodeKind::File { size, source, .. } = &node.kind else {
+        let NodeKind::File {
+            size, crc, source, ..
+        } = &node.kind
+        else {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         };
-        let size = *size;
+        let (size, crc) = (*size, *crc);
         let slice = |b: &Bytes| {
             let start = offset.min(b.len() as u64) as usize;
             let end = (offset.saturating_add(count as u64)).min(b.len() as u64) as usize;
@@ -731,14 +794,14 @@ impl NFSFileSystem for ItchFs {
             Source::Inline(b) => slice(b),
             Source::Zip(index) if size <= self.0.mem.max_bytes() => slice(
                 &self
-                    .file_bytes(id, no, ver, *index, size)
+                    .file_bytes(id, no, ver, *index, size, crc)
                     .await
                     .map_err(io_err)?,
             ),
             source => {
                 let path = match source {
-                    Source::Zip(index) => self.spill(id, no, ver, *index, size).await,
-                    _ => self.ensure_archive(no, ver).await,
+                    Source::Zip(index) => self.spill(id, no, ver, *index, size, crc).await,
+                    _ => self.ensure_archive(no, ver).await.map(|(path, _)| path),
                 }
                 .map_err(io_err)?;
                 tokio::task::spawn_blocking(move || archive::read_range(&path, offset, count))

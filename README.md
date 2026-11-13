@@ -10,7 +10,7 @@ I had claude build this because I was fed up with self-hosting git lfs and also 
 A read-only NFSv3 export, laid out as
 
 ```
-/<creator>.<pack>/<version>/<contents of the zip ...>
+/<creator>.<pack>/<version>/<contents of the archive ...>
 ```
 
 for example
@@ -28,9 +28,14 @@ for example
   same pack is hidden, so the only path that works is the earliest one. Each
   version has a `.itch-nfs-deduplicated.tsv` at its top listing what was hidden
   and where the earliest copy is.
-* Zip uploads are exposed decompressed. Anything else (`.7z`, `.rar`, a lone
-  `.png`, ...) is exposed as the single uploaded file. `__MACOSX` and `.DS_Store`
-  entries are dropped.
+* **Archives are unpacked, recursively.** Uploads in zip, 7z, rar, tar, tar.gz,
+  tar.bz2, tar.xz or tar.zst form are exposed as their contents. An archive
+  *inside* an upload becomes a directory named after it, up to 8 levels deep:
+  `Pack.zip` containing `sfx.tar.gz` shows up as `<version>/sfx.tar.gz/boom.ogg`.
+* Only files with an archive extension are opened, so archives in disguise
+  (`.unitypackage`, `.jar`, `.love`, ...) stay whole. Anything that is not an
+  archive, or cannot be opened (corrupt, password-protected), is exposed as the
+  file itself. `__MACOSX` and `.DS_Store` entries are dropped.
 
 itch.io keeps no history for an upload that a creator replaces or deletes, so
 history starts when itch-nfs first sees a pack: it polls the packs you have
@@ -56,6 +61,7 @@ The token is an itch.io OAuth access token or an API key
 | `--cache-max-mb` | `ITCH_NFS_CACHE_MAX_MB` | `1024` | budget for decompressed assets in memory |
 | `--cache-ttl` | `ITCH_NFS_CACHE_TTL` | `600` | seconds an unused asset stays in memory |
 | `--refresh-interval` | `ITCH_NFS_REFRESH_INTERVAL` | `900` | seconds between polls of itch.io |
+| `--max-unpacked-gb` | `ITCH_NFS_MAX_UNPACKED_GB` | `100` | refuse uploads that decompress to more than this (archive bombs) |
 
 There is no authentication on the export: bind it to a private interface.
 
@@ -75,7 +81,10 @@ mount point to `volumes` in the runner's `config.toml`
 ## Caching
 
 * **Archives** are downloaded on first use to `--archive-dir` and reused across
-  restarts. Listing a pack's versions downloads nothing; opening a version
+  restarts. A plain zip is kept as downloaded. Anything else, and any zip with
+  archives nested in it, is flattened once into a single zip, because zip is the
+  only one of these formats that allows one file to be read without
+  decompressing the rest. Listing a pack's versions downloads nothing; opening a version
   downloads it and every earlier version of that pack once (their listings are
   needed for de-duplication, and are then kept in `--state-dir`). The directory
   has no size limit.
@@ -98,3 +107,17 @@ their upload.
 ## Development
 
 `cargo test` runs the server against a mock itch.io API and a real NFSv3 client.
+
+CI (`.github/workflows/ci.yml`) additionally runs the release binary, mounts it
+with the Linux kernel NFS client and checks the mount with `ci/validate.py`:
+
+* **against the mock**, where the whole tree must match `ci/mock-expected.txt`
+  (regenerate with `UPDATE_EXPECTED=1 cargo test`);
+* **against itch.io**, using the `ITCH_TOKEN` repository secret. It picks the
+  smallest of the first 25 packs in the library, reads every file of every
+  version, and checks that nothing is duplicated between versions and nothing
+  is writable. Set the repository variable `ITCH_NFS_CI_PACK` to a pack
+  directory name to pin which pack is used. Pack names are kept out of the
+  logs unless the variable `ITCH_NFS_CI_SHOW_NAMES` is `1`.
+
+To run the same check by hand: `ITCH_TOKEN=... ci/mount-and-validate.sh`.

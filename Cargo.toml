@@ -7,24 +7,39 @@ edition = "2024"
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 bytes = "1.12.1"
+bzip2 = "0.6.1"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crc32fast = "1.5.5"
+flate2 = "1.1.11"
 futures-util = "0.3.34"
+lzma-rust2 = "0.25.0"
 nfsserve = "0.11"
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream", "query", "http2", "system-proxy"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sevenz-rust2 = "0.25.0"
+tar = "0.4.46"
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unrar = "0.5.8"
 zip = { version = "9.5.1", default-features = false, features = ["deflate", "bzip2", "zstd", "lzma"] }
+zstd = "0.14.4"
 
 [dev-dependencies]
 axum = "0.8.9"
+bzip2 = "0.6.1"
 crc32fast = "1.5.5"
+flate2 = "1.1.11"
+lzma-rust2 = "0.25.0"
 nfs3_client = { version = "0.9.1", features = ["tokio"] }
 serde_json = "1.0.154"
+sevenz-rust2 = "0.25.0"
+tar = "0.4.46"
 tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["full"] }
 zip = "9.5.1"
+zstd = "0.14.4"

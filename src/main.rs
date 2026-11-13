@@ -39,6 +39,10 @@ struct Args {
     #[arg(long, env = "ITCH_NFS_CACHE_TTL", default_value_t = 600)]
     cache_ttl: u64,
 
+    /// Refuse uploads that decompress to more than this many GiB (archive bombs).
+    #[arg(long, env = "ITCH_NFS_MAX_UNPACKED_GB", default_value_t = 100)]
+    max_unpacked_gb: u64,
+
     /// Seconds between checks for new packs and new versions.
     #[arg(long, env = "ITCH_NFS_REFRESH_INTERVAL", default_value_t = 900)]
     refresh_interval: u64,
@@ -78,6 +82,7 @@ async fn main() -> Result<()> {
         cache_max_bytes: args.cache_max_mb * 1024 * 1024,
         cache_ttl: Duration::from_secs(args.cache_ttl),
         refresh_interval: Duration::from_secs(args.refresh_interval),
+        max_unpacked_bytes: args.max_unpacked_gb.saturating_mul(1 << 30),
     };
     let fs = ItchFs::new(cfg, ItchClient::new(&args.api_url, token)?)?;
     let listener = NFSTcpListener::bind(&args.listen, fs.clone())

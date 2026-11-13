@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  mount-mock:
+    name: Mount against a mock itch.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nfs-common
+      - run: cargo build --release --bin itch-nfs --example mock_itch
+      - name: Serve, mount and validate the fixture pack
+        env:
+          ITCH_TOKEN: test-token
+          ITCH_NFS_API_URL: http://127.0.0.1:8099
+          SHOW_NAMES: 1
+        run: |
+          target/release/examples/mock_itch 127.0.0.1:8099 &
+          ci/mount-and-validate.sh --all --expect ci/mock-expected.txt
+
+  mount-live:
+    name: Mount against itch.io
+    runs-on: ubuntu-latest
+    # Secrets are not available to pull requests from forks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for the token
+        env:
+          ITCH_TOKEN: ${{ secrets.ITCH_TOKEN }}
+        run: |
+          if [ -z "$ITCH_TOKEN" ]; then
+            echo "::error::Add an itch.io API key as the ITCH_TOKEN repository secret (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nfs-common
+      - run: cargo build --release --bin itch-nfs
+      - name: Serve, mount and validate real packs
+        env:
+          ITCH_TOKEN: ${{ secrets.ITCH_TOKEN }}
+          # Optional repository variables: a pack directory name to validate
+          # (default: the smallest of the first 25), and 1 to print pack names.
+          PACK: ${{ vars.ITCH_NFS_CI_PACK }}
+          SHOW_NAMES: ${{ vars.ITCH_NFS_CI_SHOW_NAMES }}
+        run: ci/mount-and-validate.sh ${PACK:+--pack "$PACK"}

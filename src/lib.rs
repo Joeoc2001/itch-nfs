@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod cache;
 pub mod fs;
+pub mod ingest;
 pub mod itch;
 pub mod state;
 pub mod tree;

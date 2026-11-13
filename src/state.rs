@@ -125,11 +125,12 @@ pub fn version_dir_name(ts: i64, filename: &str, upload_id: u64, build_id: Optio
     let date = chrono::DateTime::from_timestamp(ts, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_default();
-    let stem = filename
-        .rsplit_once('.')
-        .map(|(s, _)| s)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(filename);
+    // Drop the extension, including compound ones like `.tar.gz`.
+    let stem = match crate::ingest::archive_suffix(filename) {
+        Some(suffix) => &filename[..filename.len() - suffix.len()],
+        None => filename.rsplit_once('.').map_or(filename, |(s, _)| s),
+    };
+    let stem = if stem.is_empty() { filename } else { stem };
     let mut name = format!("{date}-{}-u{upload_id}", slug(stem));
     if let Some(b) = build_id {
         name.push_str(&format!("-b{b}"));

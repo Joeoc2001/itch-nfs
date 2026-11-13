@@ -1,17 +1,13 @@
 //! End-to-end: a mock itch.io API, the real server, and a real NFSv3 client.
 
-use std::collections::BTreeMap;
-use std::io::Write;
+mod support;
+
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use axum::Router;
-use axum::extract::{Path as UrlPath, Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::routing::get;
 use itch_nfs::fs::{Config, ItchFs};
 use itch_nfs::itch::ItchClient;
 use itch_nfs::tree::DEDUP_FILE;
@@ -20,104 +16,7 @@ use nfs3_client::nfs3_types::nfs3::{self, Nfs3Result, filename3, nfsstat3};
 use nfs3_client::nfs3_types::xdr_codec::Opaque;
 use nfs3_client::tokio::{TokioConnector, TokioIo};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use serde_json::json;
-
-const TOKEN: &str = "test-token";
-const GAME: u64 = 500;
-const KEY: u64 = 77;
-
-struct MockUpload {
-    filename: String,
-    updated_at: String,
-    data: Vec<u8>,
-}
-
-#[derive(Default)]
-struct Mock {
-    uploads: Mutex<BTreeMap<u64, MockUpload>>,
-    downloads: AtomicUsize,
-}
-
-type Params = Query<BTreeMap<String, String>>;
-
-fn authorised(headers: &HeaderMap, params: &BTreeMap<String, String>) -> bool {
-    headers.get("authorization").is_some_and(|v| v == TOKEN)
-        && params
-            .get("download_key_id")
-            .is_none_or(|k| *k == KEY.to_string())
-}
-
-async fn owned_keys(
-    headers: HeaderMap,
-    Query(params): Params,
-) -> (StatusCode, axum::Json<serde_json::Value>) {
-    if !authorised(&headers, &params) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"errors": ["invalid key"]})),
-        );
-    }
-    let keys = match params.get("page").map(String::as_str) {
-        Some("1") => {
-            json!([{"id": KEY, "game_id": GAME, "game": {"id": GAME, "title": "Tiny Pack", "url": "https://creator.itch.io/tiny-pack"}}])
-        }
-        _ => json!({}),
-    };
-    (
-        StatusCode::OK,
-        axum::Json(json!({"owned_keys": keys, "page": 1, "per_page": 50})),
-    )
-}
-
-async fn uploads(
-    State(mock): State<Arc<Mock>>,
-    headers: HeaderMap,
-    UrlPath(game): UrlPath<u64>,
-    Query(params): Params,
-) -> (StatusCode, axum::Json<serde_json::Value>) {
-    if !authorised(&headers, &params) || game != GAME || !params.contains_key("download_key_id") {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({"errors": ["invalid game"]})),
-        );
-    }
-    let list: Vec<_> = mock
-        .uploads
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(id, u)| json!({"id": id, "filename": u.filename, "size": u.data.len(), "md5_hash": format!("md5-{}-{}", u.data.len(), crc32fast::hash(&u.data)), "storage": "hosted", "created_at": u.updated_at, "updated_at": u.updated_at}))
-        .collect();
-    (StatusCode::OK, axum::Json(json!({"uploads": list})))
-}
-
-async fn download(
-    State(mock): State<Arc<Mock>>,
-    headers: HeaderMap,
-    UrlPath(id): UrlPath<u64>,
-    Query(params): Params,
-) -> Result<Vec<u8>, StatusCode> {
-    if !authorised(&headers, &params) || !params.contains_key("download_key_id") {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    mock.downloads.fetch_add(1, Ordering::SeqCst);
-    mock.uploads
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map(|u| u.data.clone())
-        .ok_or(StatusCode::NOT_FOUND)
-}
-
-fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    for (name, data) in files {
-        w.start_file(*name, zip::write::SimpleFileOptions::default())
-            .unwrap();
-        w.write_all(data).unwrap();
-    }
-    w.finish().unwrap().into_inner()
-}
+use support::{GAME, Mock, MockUpload, TOKEN, zip_of};
 
 type Conn = nfs3_client::Nfs3Connection<TokioIo<tokio::net::TcpStream>>;
 
@@ -128,6 +27,7 @@ async fn serve(mock_addr: SocketAddr, state_dir: &Path, archive_dir: &Path) -> (
         cache_max_bytes: 64 * 1024,
         cache_ttl: Duration::from_secs(60),
         refresh_interval: Duration::from_secs(3600),
+        max_unpacked_bytes: 1 << 30,
     };
     let fs = ItchFs::new(
         cfg,
@@ -242,25 +142,18 @@ async fn versions_are_pinned_and_deduplicated() {
     let mock = Arc::new(Mock::default());
     mock.uploads.lock().unwrap().insert(
         1,
-        MockUpload {
-            filename: "Tiny Pack v1.zip".into(),
-            updated_at: "2024-01-05T10:00:00.000000000Z".into(),
-            data: zip_of(&[
+        MockUpload::new(
+            "Tiny Pack v1.zip",
+            "2024-01-05",
+            zip_of(&[
                 ("tiny/a.png", b"aaaa"),
                 ("tiny/b.png", b"bbbb"),
                 ("tiny/big.bin", &big),
                 ("__MACOSX/tiny/._a.png", b"junk"),
             ]),
-        },
+        ),
     );
-    let app = Router::new()
-        .route("/profile/owned-keys", get(owned_keys))
-        .route("/games/{id}/uploads", get(uploads))
-        .route("/uploads/{id}/download", get(download))
-        .with_state(mock.clone());
-    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mock_addr = http.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(http, app).await });
+    let mock_addr = support::spawn(mock.clone()).await;
 
     let state_dir = tempfile::tempdir().unwrap();
     let archive_dir = tempfile::tempdir().unwrap();
@@ -307,16 +200,16 @@ async fn versions_are_pinned_and_deduplicated() {
     // The creator publishes v2 as a second upload: a unchanged, b changed, c new.
     mock.uploads.lock().unwrap().insert(
         2,
-        MockUpload {
-            filename: "Tiny Pack v2.zip".into(),
-            updated_at: "2024-06-01T10:00:00.000000000Z".into(),
-            data: zip_of(&[
+        MockUpload::new(
+            "Tiny Pack v2.zip",
+            "2024-06-01",
+            zip_of(&[
                 ("tiny-v2/a.png", b"aaaa"),
                 ("tiny-v2/b.png", b"BBBB"),
                 ("tiny-v2/extra/c.png", b"cccc"),
                 ("tiny-v2/big.bin", &big),
             ]),
-        },
+        ),
     );
     fs.refresh_all().await;
     let v2 = "creator.tiny-pack/2024-06-01-tiny-pack-v2-u2";
@@ -370,11 +263,11 @@ async fn versions_are_pinned_and_deduplicated() {
     // its listing, and keeps serving from the cached archive.
     mock.uploads.lock().unwrap().insert(
         1,
-        MockUpload {
-            filename: "Tiny Pack v1.zip".into(),
-            updated_at: "2024-09-01T10:00:00.000000000Z".into(),
-            data: zip_of(&[("tiny/a.png", b"aaaa"), ("tiny/d.png", b"dddd")]),
-        },
+        MockUpload::new(
+            "Tiny Pack v1.zip",
+            "2024-09-01",
+            zip_of(&[("tiny/a.png", b"aaaa"), ("tiny/d.png", b"dddd")]),
+        ),
     );
     fs.refresh_all().await;
     let v3 = "creator.tiny-pack/2024-09-01-tiny-pack-v1-u1";
@@ -386,7 +279,7 @@ async fn versions_are_pinned_and_deduplicated() {
     // If the cached archive of a superseded version is lost, its files fail
     // loudly rather than being served from the replacement upload.
     drop(fs);
-    std::fs::remove_file(archive_dir.path().join(format!("{GAME}-1.bin"))).unwrap();
+    std::fs::remove_file(archive_dir.path().join(format!("{GAME}-1.zip"))).unwrap();
     let (_fs, mut c) = serve(mock_addr, state_dir.path(), archive_dir.path()).await;
     assert_eq!(
         ls(&mut c, &format!("{v1}/tiny")).await,
@@ -397,4 +290,83 @@ async fn versions_are_pinned_and_deduplicated() {
         nfsstat3::NFS3ERR_IO
     );
     assert_eq!(cat(&mut c, &format!("{v2}/tiny-v2/b.png")).await, b"BBBB");
+}
+
+/// Every regular file under `path`, as paths relative to the export root.
+async fn tree(c: &mut Conn, path: &str, out: &mut Vec<String>) {
+    for name in ls(c, path).await {
+        let child = format!("{path}/{name}");
+        let fh = walk(c, &child).await.unwrap();
+        let attr = c
+            .getattr(&nfs3::GETATTR3args { object: fh })
+            .await
+            .unwrap()
+            .unwrap()
+            .obj_attributes;
+        if matches!(attr.type_, nfs3::ftype3::NF3DIR) {
+            Box::pin(tree(c, &child, out)).await;
+        } else {
+            out.push(child);
+        }
+    }
+}
+
+/// The fixture pack covers every archive format, nesting and de-duplication.
+/// CI mounts the same pack with the kernel client and checks the same listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_format_is_unpacked_recursively() {
+    let mock = Arc::new(Mock::default());
+    *mock.uploads.lock().unwrap() = support::fixture_uploads();
+    let mock_addr = support::spawn(mock.clone()).await;
+    let state_dir = tempfile::tempdir().unwrap();
+    let archive_dir = tempfile::tempdir().unwrap();
+    let (_fs, mut c) = serve(mock_addr, state_dir.path(), archive_dir.path()).await;
+
+    let mut files = Vec::new();
+    tree(&mut c, "creator.tiny-pack", &mut files).await;
+    let listing = files.join("\n") + "\n";
+    let expected =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ci/mock-expected.txt"))
+            .unwrap_or_default();
+    if std::env::var_os("UPDATE_EXPECTED").is_some() {
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/ci/mock-expected.txt"),
+            &listing,
+        )
+        .unwrap();
+    } else {
+        assert_eq!(listing, expected, "run with UPDATE_EXPECTED=1 to accept");
+    }
+
+    let v1 = "creator.tiny-pack/2024-01-05-tiny-pack-v1-u1/tiny";
+    assert_eq!(
+        cat(
+            &mut c,
+            &format!("{v1}/extras.tar.gz/more/deeper.zip/deep.txt")
+        )
+        .await,
+        b"deep\n"
+    );
+    let v2 = "creator.tiny-pack/2024-02-05-tiny-pack-v2-u2/tiny-v2";
+    assert_eq!(
+        cat(&mut c, &format!("{v2}/sounds.tar.xz/s.ogg")).await,
+        b"ogg1"
+    );
+    assert_eq!(
+        cat(
+            &mut c,
+            "creator.tiny-pack/2024-03-05-tiny-docs-u3/docs/readme.txt"
+        )
+        .await,
+        b"read me\n"
+    );
+    assert_eq!(
+        cat(
+            &mut c,
+            "creator.tiny-pack/2024-04-05-tiny-extras-u4/fonts.tar.zst/f.ttf"
+        )
+        .await,
+        b"font"
+    );
+    assert_eq!(mock.downloads.load(Ordering::SeqCst), 5);
 }
