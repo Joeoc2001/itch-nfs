@@ -36,6 +36,24 @@ pub enum Outcome {
     Raw,
 }
 
+/// The error (somewhere in the chain) when an upload is refused for
+/// decompressing to more than [`Limits::max_unpacked_bytes`].
+#[derive(Debug)]
+pub struct TooBig;
+
+impl std::fmt::Display for TooBig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("upload decompresses to more than the configured limit")
+    }
+}
+
+impl std::error::Error for TooBig {}
+
+/// Whether `e` is an upload having been refused as [`TooBig`].
+pub fn is_too_big(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<TooBig>())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Compression {
     None,
@@ -190,7 +208,7 @@ impl Ctx<'_> {
     fn spend(&mut self, n: u64) -> Result<()> {
         if n > self.budget {
             self.fatal = true;
-            bail!("upload decompresses to more than the configured limit");
+            return Err(TooBig.into());
         }
         self.budget -= n;
         Ok(())
@@ -243,9 +261,7 @@ pub fn ingest(
                     total = total.saturating_add(zip.by_index_raw(i)?.size());
                 }
                 if total > limits.max_unpacked_bytes {
-                    bail!(
-                        "unpack {filename}: upload decompresses to more than the configured limit"
-                    );
+                    return Err(anyhow!(TooBig).context(format!("unpack {filename}")));
                 }
                 return Ok(Outcome::ZipAsIs);
             }
@@ -455,7 +471,7 @@ fn expand(
                         ctx.spend(0)?;
                         if entry.unpacked_size > ctx.budget {
                             ctx.fatal = true;
-                            bail!("upload decompresses to more than the configured limit");
+                            return Err(TooBig.into());
                         }
                         let tmp = ctx.temp_file()?;
                         let next = header.extract_to(tmp.path())?;

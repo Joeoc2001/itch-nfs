@@ -973,6 +973,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-rust2",
+ "sha2",
  "tar",
  "tempfile",
  "tokio",

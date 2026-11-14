@@ -49,14 +49,29 @@ def digest(path):
     return h.hexdigest(), size
 
 
-def upload_sizes(state_dir):
-    """Pack directory name -> total size of its uploads, from the server's state."""
+def upload_sizes(archive_dir):
+    """Pack directory name -> total size of its archived uploads, from the archive."""
+    sizes = {}
+    packs = os.path.join(archive_dir, "packs")
     try:
-        with open(os.path.join(state_dir, "state.json")) as f:
-            games = json.load(f)["games"].values()
-    except (OSError, ValueError, KeyError):
-        return {}
-    return {g["name"]: sum(v.get("size") or 0 for v in g["versions"]) for g in games if g["versions"]}
+        names = os.listdir(packs)
+    except OSError:
+        return sizes
+    for pack in names:
+        total, versions = 0, 0
+        try:
+            for version in os.listdir(os.path.join(packs, pack)):
+                try:
+                    with open(os.path.join(packs, pack, version, "version.json")) as f:
+                        total += json.load(f).get("size") or 0
+                    versions += 1
+                except (OSError, ValueError):
+                    continue  # pack.json, or a version that is not committed
+        except OSError:
+            continue
+        if versions:
+            sizes[pack] = total
+    return sizes
 
 
 def choose_packs(args, packs):
@@ -67,12 +82,9 @@ def choose_packs(args, packs):
         return [p for p in args.pack if p in packs]
     if args.all:
         return packs
-    # Listing a pack's versions costs one API call and no download, so look at
-    # a handful and take the cheapest to download.
+    # Look at a handful and take the smallest.
     candidates = packs[: args.scan]
-    for p in candidates:
-        os.listdir(os.path.join(args.mount, p))
-    sizes = upload_sizes(args.state_dir) if args.state_dir else {}
+    sizes = upload_sizes(args.archive_dir) if args.archive_dir else {}
     candidates = [p for p in candidates if os.listdir(os.path.join(args.mount, p))]
     candidates.sort(key=lambda p: (sizes.get(p, float("inf")), p))
     return candidates[: args.count]
@@ -142,7 +154,7 @@ def validate_pack(args, pack, label):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mount")
-    ap.add_argument("--state-dir", help="the server's --state-dir, used to pick the smallest packs")
+    ap.add_argument("--archive-dir", help="the archive being served, used to pick the smallest packs and to check that the export has every archived pack")
     ap.add_argument("--pack", action="append", help="validate this pack directory (repeatable)")
     ap.add_argument("--all", action="store_true", help="validate every pack")
     ap.add_argument("--count", type=int, default=1, help="how many packs to validate otherwise")
@@ -155,7 +167,12 @@ def main():
     packs = sorted(os.listdir(args.mount))
     print(f"{len(packs)} pack(s) in the export")
     if not packs:
-        fail("the export is empty: is the token valid, and does the account own anything?")
+        fail("the export is empty: has the scanner archived anything?")
+    if args.archive_dir:
+        # Every pack with a committed version is exported, and nothing else is.
+        archived = sorted(upload_sizes(args.archive_dir))
+        if archived != packs:
+            fail(f"the export has {len(packs)} pack(s) but the archive has {len(archived)} with committed versions" + (f": {sorted(set(archived) ^ set(packs))}" if args.names else ""))
     try:
         os.mkdir(os.path.join(args.mount, "itch-nfs-write-test"))
         fail("the export root is writable")

@@ -38,17 +38,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y nfs-common
+      - run: sudo apt-get update && sudo apt-get install -y nfs-common strace
       - run: cargo build --release --bin itch-nfs --example mock_itch
-      - name: Serve, mount and validate the fixture pack
+      - name: Scan, serve, mount and validate the fixture pack
         env:
           ITCH_TOKEN: test-token
           ITCH_NFS_API_URL: http://127.0.0.1:8099
           SHOW_NAMES: 1
         run: |
           target/release/examples/mock_itch 127.0.0.1:8099 &
+          mock=$!
           timeout 10 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/8099) 2>/dev/null; do sleep 0.1; done'
-          ci/mount-and-validate.sh --all --expect ci/mock-expected.txt
+          # The scanner only ever writes new files, front to back.
+          ci/check-archive-writes.sh
+          # The mock API is stopped once the scanner is done: the frontend
+          # serves from the archive alone.
+          STOP_AFTER_SCAN=$mock ci/mount-and-validate.sh --all --expect ci/mock-expected.txt
 
   mount-live:
     name: Mount against itch.io
@@ -69,11 +74,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y nfs-common
       - run: cargo build --release --bin itch-nfs
-      - name: Serve, mount and validate real packs
+      - name: Scan, serve, mount and validate a real pack
         env:
           ITCH_TOKEN: ${{ secrets.ITCH_TOKEN }}
           # Optional repository variables: a pack directory name to validate
-          # (default: the smallest of the first 25), and 1 to print pack names.
+          # (default: the one `scan --list` shows to be the smallest
+          # download), and 1 to print pack names.
           PACK: ${{ vars.ITCH_NFS_CI_PACK }}
           SHOW_NAMES: ${{ vars.ITCH_NFS_CI_SHOW_NAMES }}
         run: ci/mount-and-validate.sh ${PACK:+--pack "$PACK"}
@@ -109,7 +115,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Serve the fixture pack from the image, mount and validate
+      - name: Scan and serve the fixture pack with the image, mount and validate
         env:
           ITCH_TOKEN: test-token
           ITCH_NFS_API_URL: http://127.0.0.1:8099
@@ -118,8 +124,9 @@ jobs:
         run: |
           cargo build --release --example mock_itch
           target/release/examples/mock_itch 127.0.0.1:8099 &
+          mock=$!
           timeout 10 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/8099) 2>/dev/null; do sleep 0.1; done'
-          ci/mount-and-validate.sh --all --expect ci/mock-expected.txt
+          STOP_AFTER_SCAN=$mock ci/mount-and-validate.sh --all --expect ci/mock-expected.txt
       # Published only from main, and only once every other job has passed.
       - name: Log in to ghcr.io
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

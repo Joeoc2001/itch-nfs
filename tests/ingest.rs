@@ -194,18 +194,30 @@ fn archive_bombs_are_refused() {
     )
     .unwrap_err();
     assert!(format!("{err:#}").contains("limit"), "{err:#}");
+    assert!(itch_nfs::ingest::is_too_big(&err), "{err:#}");
     // Nested, too: an error rather than a silent fallback.
     let nested = zip_of(&[("inner.tar.gz", &bomb)]);
-    assert!(
-        run(
-            "p.zip",
-            &nested,
-            Limits {
-                max_unpacked_bytes: 500_000,
-                ..LIMITS
-            }
-        )
-        .is_err()
-    );
+    let err = run(
+        "p.zip",
+        &nested,
+        Limits {
+            max_unpacked_bytes: 500_000,
+            ..LIMITS
+        },
+    )
+    .unwrap_err();
+    assert!(itch_nfs::ingest::is_too_big(&err), "{err:#}");
+    // A plain zip is served as it is, so its declared sizes are checked.
+    let plain = zip_of(&[("a", &big), ("b", &big), ("c", &big)]);
+    let err = run(
+        "p.zip",
+        &plain,
+        Limits {
+            max_unpacked_bytes: 500_000,
+            ..LIMITS
+        },
+    )
+    .unwrap_err();
+    assert!(itch_nfs::ingest::is_too_big(&err), "{err:#}");
     assert!(run("p.zip", &nested, LIMITS).is_ok());
 }

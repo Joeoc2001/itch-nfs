@@ -30,3 +30,4 @@ rustc-ice-*.txt
 
 # itch-nfs local state
 /itch-nfs-state
+/itch-nfs-archive

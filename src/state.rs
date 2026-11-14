@@ -1,4 +1,5 @@
-//! Persistent state: which packs and versions exist, and what they are called.
+//! How packs and versions are named, and the `state.json` of deployments
+//! from before the archive directory existed (read only by `migrate`).
 //!
 //! Names and numbering are assigned once and never change, so that paths pinned
 //! by a build stay valid (and NFS file handles survive a server restart).
@@ -9,9 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub const MAX_VERSIONS: usize = 0xFFFF;
-pub const MAX_GAMES: u32 = 0xF_FFFF;
-
+/// The old `state.json`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
     /// Keyed by our own stable game number (not the itch id), starting at 1.

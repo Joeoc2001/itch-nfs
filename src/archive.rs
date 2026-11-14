@@ -1,4 +1,4 @@
-//! Reading asset pack archives from the on-disk cache.
+//! Reading asset pack archives: listing them, and extracting from them.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -11,15 +11,21 @@ use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     /// An archive (flattened to a zip if need be), exposed as its contents.
+    // The aliases are how manifests written before the archive directory
+    // existed spell it; `migrate` reads those.
+    #[serde(alias = "Zip")]
     Zip,
     /// Anything else, exposed as the single downloaded file.
+    #[serde(alias = "Raw")]
     Raw,
 }
 
-/// The file listing of one pack version. Persisted, so that directory listings
-/// and de-duplication never need the archive again.
+/// The file listing of one pack version. Stored next to the version in the
+/// archive directory, so that directory listings and de-duplication never
+/// need to open the upload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub kind: Kind,
@@ -83,16 +89,10 @@ pub fn scan(path: &Path, filename: &str, zip: bool) -> Result<Manifest> {
         hasher.update(&buf[..n]);
         size += n as u64;
     }
-    let name = filename.replace(['/', '\\'], "_");
-    let name = if name.is_empty() || name == "." || name == ".." {
-        "upload.bin".to_string()
-    } else {
-        name
-    };
     Ok(Manifest {
         kind: Kind::Raw,
         entries: vec![Entry {
-            path: name,
+            path: crate::store::safe_file_name(filename),
             size,
             crc: hasher.finalize(),
             mtime: 0,
@@ -205,5 +205,27 @@ impl Archives {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_is_written_lower_case_and_read_either_way() {
+        let m = Manifest {
+            kind: Kind::Zip,
+            entries: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            r#"{"kind":"zip","entries":[]}"#
+        );
+        // As written before the archive directory existed.
+        let old: Manifest = serde_json::from_str(r#"{"kind":"Raw","entries":[]}"#).unwrap();
+        assert_eq!(old.kind, Kind::Raw);
+        let old: Manifest = serde_json::from_str(r#"{"kind":"Zip","entries":[]}"#).unwrap();
+        assert_eq!(old.kind, Kind::Zip);
     }
 }
