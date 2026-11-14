@@ -7,7 +7,9 @@
 //!
 //! Copies are named by their SHA-256, so the directory survives restarts and
 //! cannot serve one file's bytes as another's. The least recently used copies
-//! are deleted once the total passes the budget.
+//! are deleted once the total passes the budget, but never the most recently
+//! used one: a file larger than the whole budget is kept until another file
+//! is used, so the cache holds at most one file beyond its budget.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -66,7 +68,7 @@ impl Drop for Cached {
             e.pins = e.pins.saturating_sub(1);
         }
         // Whatever could not be evicted while this was pinned can go now.
-        self.inner.evict(&mut st, None);
+        self.inner.evict(&mut st);
     }
 }
 
@@ -76,14 +78,18 @@ fn is_sha256(s: &str) -> bool {
 
 impl Inner {
     /// Delete least recently used copies until the budget is met. Pinned
-    /// copies and `keep` are spared, so the total can exceed the budget while
-    /// they are in use (or if one file is larger than the whole budget).
-    fn evict(&self, st: &mut State, keep: Option<&str>) {
+    /// copies are spared, so the total can exceed the budget while they are in
+    /// use. So is the most recently used copy, pinned or not: callers hold a
+    /// copy for one read at a time, and a file larger than the whole budget
+    /// would otherwise be deleted after each read and copied out of the
+    /// archive again for the next.
+    fn evict(&self, st: &mut State) {
         while st.bytes > self.max_bytes {
+            let newest = st.entries.values().map(|e| e.last_used).max();
             let victim = st
                 .entries
                 .iter()
-                .filter(|(k, e)| e.pins == 0 && Some(k.as_str()) != keep)
+                .filter(|(_, e)| e.pins == 0 && Some(e.last_used) != newest)
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(k, _)| k.clone());
             let Some(key) = victim else {
@@ -167,7 +173,7 @@ impl DiskCache {
             locks: KeyedLocks::default(),
             copies: AtomicU64::new(0),
         };
-        inner.evict(&mut st, None);
+        inner.evict(&mut st);
         *inner.state.lock().unwrap() = st;
         Ok(Self(Arc::new(inner)))
     }
@@ -220,7 +226,16 @@ impl DiskCache {
                 pins: 1,
             },
         );
-        self.0.evict(&mut st, Some(sha256));
+        // The new copy is the most recently used, so this spares it.
+        self.0.evict(&mut st);
+        if size > self.0.max_bytes {
+            warn!(
+                "{} ({size} bytes) is larger than the whole disk cache budget ({} bytes): \
+                 its copy is kept until another file is read, then copied from the archive again",
+                src.display(),
+                self.0.max_bytes
+            );
+        }
         Ok(Cached {
             path: dest,
             key: sha256.to_string(),
@@ -347,6 +362,37 @@ mod tests {
         let big = c.get(&big, 400, &sha_big).await.unwrap();
         assert_eq!(std::fs::metadata(big.path()).unwrap().len(), 400);
         assert_eq!(names(cache.path()), [sha_big]);
+    }
+
+    #[tokio::test]
+    async fn a_file_over_the_budget_is_copied_once_and_kept_until_another_is_used() {
+        let (src, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let c = DiskCache::new(cache.path(), 100).unwrap();
+        let (big, _, sha_big) = source(src.path(), "big", 1, 150);
+        // Each handle is dropped before the next read, as the server does.
+        for _ in 0..5 {
+            let got = c.get(&big, 150, &sha_big).await.unwrap();
+            assert_eq!(std::fs::read(got.path()).unwrap(), vec![1u8; 150]);
+        }
+        assert_eq!(c.copies(), 1, "read from the archive once");
+        assert_eq!(c.bytes(), 150, "one file beyond the budget");
+        assert_eq!(names(cache.path()), std::slice::from_ref(&sha_big));
+        // It is also kept across a restart.
+        let c = DiskCache::new(cache.path(), 100).unwrap();
+        c.get(&big, 150, &sha_big).await.unwrap();
+        assert_eq!(c.copies(), 0);
+        // Another file needs the space: the big one goes, even though the
+        // small one fits the budget by itself.
+        let (small, _, sha_small) = source(src.path(), "small", 2, 50);
+        c.get(&small, 50, &sha_small).await.unwrap();
+        assert_eq!(names(cache.path()), [sha_small]);
+        assert_eq!(c.bytes(), 50);
+        // Two files over the budget never stay together.
+        let (huge, _, sha_huge) = source(src.path(), "huge", 3, 300);
+        c.get(&big, 150, &sha_big).await.unwrap();
+        c.get(&huge, 300, &sha_huge).await.unwrap();
+        assert_eq!(names(cache.path()), [sha_huge]);
+        assert_eq!(c.bytes(), 300);
     }
 
     #[tokio::test]

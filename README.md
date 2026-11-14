@@ -294,8 +294,13 @@ keeps three things in `--cache-dir` and in memory so that it rarely has to:
   version twice reads its zip from the archive once. A copy that does not
   match its checksum is discarded and the read fails with an I/O error. The
   least recently used copies are deleted when `--disk-cache-max-gb` is
-  exceeded (a copy in use is never deleted, so one zip larger than the whole
-  budget still works).
+  exceeded, except a copy in use and the most recently used copy. A zip
+  larger than the whole budget is therefore copied once and kept until a
+  different zip is read, so the directory can hold one file more than the
+  budget. Reading two such zips in turn copies each from the archive again
+  every time the reads switch; a warning is logged whenever a file over the
+  budget is copied, and the budget should be raised above the largest served
+  file if it appears.
 * **Decompressed assets** are cached in memory, dropped `--cache-ttl` seconds
   after their last read, and evicted at random when `--cache-max-mb` is
   exceeded. A single file larger than the whole budget is extracted to
