@@ -217,8 +217,17 @@ struct MigrateArgs {
     max_unpacked_gb: u64,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("start the async runtime")?;
+    let result = runtime.block_on(run());
+    // Do not wait for blocking work (unpacking, copying into the archive)
+    // that a shutdown signal cut loose: it may take hours, and whatever it
+    // leaves half done is redone by the next scan.
+    runtime.shutdown_background();
+    result
+}
+
+async fn run() -> Result<()> {
     // Logs go to stderr: stdout is for `scan --list`.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -250,9 +259,15 @@ async fn run_scan(args: ScanArgs) -> Result<()> {
         },
         concurrency: args.concurrency,
     };
+    // Before the first pass, not after it: a first scan can run for hours,
+    // and as PID 1 it would not react to SIGTERM at all until then.
+    let mut shutdown = Shutdown::new()?;
     let scanner = Scanner::new(cfg, client)?;
     if args.list {
-        let report = scanner.list().await?;
+        let report = tokio::select! {
+            report = scanner.list() => report?,
+            _ = shutdown.recv() => bail!("interrupted"),
+        };
         for p in &report.pending {
             println!(
                 "{}\t{}\t{}\t{}",
@@ -273,7 +288,19 @@ async fn run_scan(args: ScanArgs) -> Result<()> {
         return Ok(());
     }
     loop {
-        let outcome = scanner.pass().await;
+        // Dropping a pass half way is safe: a version without its commit
+        // marker is redone by the next pass.
+        let outcome = tokio::select! {
+            outcome = scanner.pass() => outcome,
+            _ = shutdown.recv() => {
+                if args.interval.is_none() {
+                    // One pass: let cron (or CI) see that it did not finish.
+                    bail!("interrupted before the scan finished; the next scan carries on");
+                }
+                tracing::info!("shutting down, the next scan carries on from here");
+                return Ok(());
+            }
+        };
         match &outcome {
             Ok(r) => tracing::info!(
                 "scanned {} pack(s): {} upload(s) archived, {} problem(s)",
@@ -296,7 +323,7 @@ async fn run_scan(args: ScanArgs) -> Result<()> {
         };
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(interval.max(1))) => {}
-            _ = shutdown_signal() => {
+            _ = shutdown.recv() => {
                 tracing::info!("shutting down");
                 return Ok(());
             }
@@ -313,6 +340,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         rescan_interval: Duration::from_secs(args.rescan_interval),
         disk_cache_max_bytes: args.disk_cache_max_gb.saturating_mul(1 << 30),
     };
+    let mut shutdown = Shutdown::new()?;
     let fs = ItchFs::new(cfg)?;
     let listener = NFSTcpListener::bind(&args.listen, fs.clone())
         .await
@@ -321,7 +349,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     tokio::spawn(async move { fs.run_maintenance().await });
     tokio::select! {
         served = listener.handle_forever() => served?,
-        _ = shutdown_signal() => tracing::info!("shutting down"),
+        _ = shutdown.recv() => tracing::info!("shutting down"),
     }
     Ok(())
 }
@@ -382,11 +410,30 @@ fn private_temp_dir() -> Result<PathBuf> {
 
 /// Ctrl-C or SIGTERM. Handled explicitly because, as PID 1 in a container,
 /// the process would otherwise ignore SIGTERM and `docker stop` would hang.
-async fn shutdown_signal() {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("install SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+///
+/// The handlers are installed when this is created and stay installed for the
+/// life of the process, so create it once, before the work starts, and wait
+/// on the same one every time: a signal that arrives while nothing is waiting
+/// is kept for the next `recv`, whereas a listener created later would never
+/// see it.
+struct Shutdown {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Shutdown {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("install the SIGINT handler")?,
+            terminate: signal(SignalKind::terminate()).context("install the SIGTERM handler")?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
     }
 }

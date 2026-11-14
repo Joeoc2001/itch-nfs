@@ -14,7 +14,8 @@
 //! The directory is meant to be an object store mount (S3 and the like), so
 //! every file in it is written once, front to back, and never touched again:
 //! no rename, no seek, no append. A version directory without `version.json`
-//! is incomplete; readers ignore it and the scanner redoes it.
+//! is incomplete; readers ignore it and the scanner redoes it. The same goes
+//! for a `version.json` or `pack.json` that a crash left empty or cut short.
 //!
 //! The scanner is the only writer, and there must be only one scanner.
 
@@ -23,7 +24,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -220,6 +220,27 @@ fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// What reading `pack.json` or `version.json` found. The files are written in
+/// place (the archive may be an object store mount, so there is no rename),
+/// which means that a crash can leave one empty or cut short. Such a file
+/// counts as not written, for readers and for the scanner alike.
+enum Meta<T> {
+    Missing,
+    /// It is there, but it does not parse or does not describe its directory.
+    Invalid(anyhow::Error),
+    Valid(T),
+}
+
+impl<T> Meta<T> {
+    fn into_result(self) -> Result<Option<T>> {
+        match self {
+            Meta::Missing => Ok(None),
+            Meta::Invalid(e) => Err(e),
+            Meta::Valid(meta) => Ok(Some(meta)),
+        }
+    }
+}
+
 /// Access to an archive directory, with an optional local copy of its (small,
 /// immutable) metadata files so that each is read from the archive only once.
 #[derive(Debug, Clone)]
@@ -304,44 +325,63 @@ impl Store {
         }
     }
 
-    fn read_json<T: DeserializeOwned>(&self, rel: &Path) -> Result<Option<T>> {
-        let Some(bytes) = self.read_meta(rel)? else {
-            return Ok(None);
+    /// `pack.json` of a pack directory, as far as it can be made out.
+    fn read_pack(&self, pack: &str) -> Result<Meta<PackMeta>> {
+        let rel = Path::new(pack).join(PACK_FILE);
+        let Some(bytes) = self.read_meta(&rel)? else {
+            return Ok(Meta::Missing);
         };
-        match serde_json::from_slice(&bytes) {
-            Ok(v) => Ok(Some(v)),
-            Err(e) => {
-                self.forget_meta(rel);
-                Err(anyhow!(e).context(format!("parse {}", rel.display())))
+        let checked = || -> Result<PackMeta> {
+            let meta: PackMeta = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", rel.display()))?;
+            if meta.name != pack {
+                bail!("{} is for a pack called {:?}", rel.display(), meta.name);
             }
-        }
+            if meta.no == 0 || meta.no > MAX_PACKS {
+                bail!("{} has pack number {}", rel.display(), meta.no);
+            }
+            Ok(meta)
+        };
+        Ok(match checked() {
+            Ok(meta) => Meta::Valid(meta),
+            Err(e) => {
+                self.forget_meta(&rel);
+                Meta::Invalid(e)
+            }
+        })
+    }
+
+    /// `version.json` of a version directory, as far as it can be made out.
+    fn read_version(&self, pack: &str, version: &str) -> Result<Meta<VersionMeta>> {
+        let rel = Path::new(pack).join(version).join(VERSION_FILE);
+        let Some(bytes) = self.read_meta(&rel)? else {
+            return Ok(Meta::Missing);
+        };
+        let checked = || -> Result<VersionMeta> {
+            let meta: VersionMeta = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", rel.display()))?;
+            meta.validate(version)
+                .map_err(|e| anyhow!("{} {e}", rel.display()))?;
+            Ok(meta)
+        };
+        Ok(match checked() {
+            Ok(meta) => Meta::Valid(meta),
+            Err(e) => {
+                self.forget_meta(&rel);
+                Meta::Invalid(e)
+            }
+        })
     }
 
     /// `pack.json` of a pack directory, if it has one.
     pub fn pack(&self, pack: &str) -> Result<Option<PackMeta>> {
-        let rel = Path::new(pack).join(PACK_FILE);
-        let Some(meta) = self.read_json::<PackMeta>(&rel)? else {
-            return Ok(None);
-        };
-        if meta.name != pack {
-            bail!("{} is for a pack called {:?}", rel.display(), meta.name);
-        }
-        if meta.no == 0 || meta.no > MAX_PACKS {
-            bail!("{} has pack number {}", rel.display(), meta.no);
-        }
-        Ok(Some(meta))
+        self.read_pack(pack)?.into_result()
     }
 
     /// `version.json` of a version directory, or `None` if the version was
     /// never committed.
     pub fn version(&self, pack: &str, version: &str) -> Result<Option<VersionMeta>> {
-        let rel = Path::new(pack).join(version).join(VERSION_FILE);
-        let Some(meta) = self.read_json::<VersionMeta>(&rel)? else {
-            return Ok(None);
-        };
-        meta.validate(version)
-            .map_err(|e| anyhow!("{} {e}", rel.display()))?;
-        Ok(Some(meta))
+        self.read_version(pack, version)?.into_result()
     }
 
     /// The file listing of a committed version, checked against its checksum.
@@ -408,47 +448,74 @@ impl Store {
                 );
                 continue;
             }
-            let mut versions: Vec<VersionMeta> = Vec::new();
-            for version_name in Self::subdirs(&self.pack_dir(&pack_name))? {
-                match self.version(&pack_name, &version_name) {
-                    Ok(Some(v)) => match versions.iter().find(|x| x.no == v.no) {
-                        Some(other) => warn!(
-                            "ignoring version {pack_name}/{version_name}: it has the number of {}",
-                            other.name
-                        ),
-                        None => versions.push(v),
-                    },
-                    Ok(None) => {}
-                    Err(e) => warn!("ignoring version {pack_name}/{version_name}: {e:#}"),
-                }
-            }
-            versions.sort_by_key(|v| v.no);
+            let versions = self.versions(&pack_name)?;
             packs.push(Pack { meta, versions });
         }
         packs.sort_by_key(|p| p.meta.no);
         Ok(packs)
     }
 
+    /// The committed versions in a pack directory, in version number order,
+    /// whether or not the pack has a readable `pack.json`. Anything malformed
+    /// is skipped with a warning.
+    pub fn versions(&self, pack_name: &str) -> Result<Vec<VersionMeta>> {
+        let mut versions: Vec<VersionMeta> = Vec::new();
+        for version_name in Self::subdirs(&self.pack_dir(pack_name))? {
+            match self.version(pack_name, &version_name) {
+                Ok(Some(v)) => match versions.iter().find(|x| x.no == v.no) {
+                    Some(other) => warn!(
+                        "ignoring version {pack_name}/{version_name}: it has the number of {}",
+                        other.name
+                    ),
+                    None => versions.push(v),
+                },
+                Ok(None) => {}
+                Err(e) => warn!("ignoring version {pack_name}/{version_name}: {e:#}"),
+            }
+        }
+        versions.sort_by_key(|v| v.no);
+        Ok(versions)
+    }
+
     // ---- writing (scanner and migrate only) ----
 
-    /// Write `pack.json`, unless the pack already has one.
+    /// Write `pack.json`, unless the pack already has this one. A `pack.json`
+    /// that cannot be read back (see [`Meta`]) is replaced; a readable one
+    /// for another pack is an error, since nothing written under it would
+    /// ever be found again.
     pub fn write_pack(&self, meta: &PackMeta) -> Result<()> {
         if !is_safe_name(&meta.name) {
             bail!("unsafe pack name {:?}", meta.name);
         }
         let dir = self.pack_dir(&meta.name);
         let path = dir.join(PACK_FILE);
-        if path.exists() {
-            return Ok(());
+        match self.read_pack(&meta.name)? {
+            Meta::Missing => {}
+            Meta::Valid(have) if have.no == meta.no && have.game_id == meta.game_id => {
+                return Ok(());
+            }
+            Meta::Valid(have) => bail!(
+                "{} already belongs to pack number {} (game {}), not number {} (game {})",
+                path.display(),
+                have.no,
+                have.game_id,
+                meta.no,
+                meta.game_id
+            ),
+            Meta::Invalid(e) => warn!("replacing {}: {e:#}", path.display()),
         }
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        write_new(&path, &serde_json::to_vec_pretty(meta)?)
+        write_new(&path, &serde_json::to_vec_pretty(meta)?)?;
+        // Whatever the local copy held, it is not this.
+        self.forget_meta(&Path::new(&meta.name).join(PACK_FILE));
+        Ok(())
     }
 
     /// Commit a version: copy each `(path in the version directory, local
     /// file)` into the archive, then write `version.json`. `meta.files` and
     /// `meta.archived_at` are filled in here. Whatever an interrupted earlier
-    /// attempt left behind is removed first.
+    /// attempt left behind is removed first, a `version.json` that cannot be
+    /// read back (see [`Meta`]) included.
     pub fn commit_version(
         &self,
         pack: &str,
@@ -460,8 +527,16 @@ impl Store {
         }
         let dir = self.version_dir(pack, &meta.name);
         let marker = dir.join(VERSION_FILE);
-        if marker.exists() {
-            bail!("{pack}/{} is already committed", meta.name);
+        match self.read_version(pack, &meta.name)? {
+            Meta::Missing => {}
+            Meta::Valid(_) => bail!("{pack}/{} is already committed", meta.name),
+            // Readers do not count this as committed, so neither may we: it
+            // would never be served and never be redone.
+            Meta::Invalid(e) => {
+                warn!("redoing {pack}/{}: {e:#}", meta.name);
+                std::fs::remove_file(&marker)
+                    .with_context(|| format!("remove {}", marker.display()))?;
+            }
         }
         remove_files(&dir)?;
         meta.files.clear();
@@ -695,6 +770,75 @@ mod tests {
         renamed.title = "Other".into();
         store.write_pack(&renamed).unwrap();
         assert_eq!(store.pack("p").unwrap().unwrap().title, "Tiny Pack");
+    }
+
+    /// The files are written in place, so a crash can leave one empty or
+    /// cut short. Readers skip such a file; the writer must not take it for
+    /// the real thing, or the version is neither served nor ever redone.
+    #[test]
+    fn a_commit_marker_that_cannot_be_read_is_replaced() {
+        for junk in [&b""[..], b"{\"no\": 1, \"na"] {
+            let (archive, scratch, cache) = (
+                tempfile::tempdir().unwrap(),
+                tempfile::tempdir().unwrap(),
+                tempfile::tempdir().unwrap(),
+            );
+            let store = Store::new(archive.path(), Some(cache.path().to_path_buf()));
+            store.write_pack(&pack_meta(1, "p")).unwrap();
+            let dir = store.version_dir("p", "v1");
+            std::fs::create_dir_all(dir.join("upload")).unwrap();
+            std::fs::write(dir.join("upload/Tiny Pack.zip"), b"hal").unwrap();
+            std::fs::write(dir.join(VERSION_FILE), junk).unwrap();
+            assert!(store.load().unwrap()[0].versions.is_empty());
+
+            let files = sources(scratch.path(), b"hello");
+            let v1 = store
+                .commit_version("p", version_meta(1, "v1"), &files)
+                .unwrap();
+            assert_eq!(store.load().unwrap()[0].versions, std::slice::from_ref(&v1));
+            // Another reader, with no local copies, agrees.
+            let fresh = Store::new(archive.path(), None);
+            assert_eq!(fresh.load().unwrap()[0].versions, std::slice::from_ref(&v1));
+            assert_eq!(
+                std::fs::read(fresh.file_path("p", "v1", &v1.files[0])).unwrap(),
+                b"hello"
+            );
+            // And now that it can be read, it is committed for good.
+            assert!(
+                store
+                    .commit_version("p", version_meta(1, "v1"), &files)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_pack_json_that_cannot_be_read_is_replaced() {
+        for junk in [&b""[..], b"{\"no\": 1, \"na"] {
+            let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let store = Store::new(archive.path(), Some(cache.path().to_path_buf()));
+            std::fs::create_dir_all(store.pack_dir("p")).unwrap();
+            std::fs::write(store.pack_dir("p").join(PACK_FILE), junk).unwrap();
+            assert!(store.load().unwrap().is_empty());
+
+            store.write_pack(&pack_meta(1, "p")).unwrap();
+            assert_eq!(store.load().unwrap()[0].meta, pack_meta(1, "p"));
+            let fresh = Store::new(archive.path(), None);
+            assert_eq!(fresh.load().unwrap()[0].meta, pack_meta(1, "p"));
+        }
+    }
+
+    /// Writing under a `pack.json` that is someone else's would put versions
+    /// where no reader looks for them.
+    #[test]
+    fn a_pack_json_of_another_pack_is_not_taken_for_ours() {
+        let archive = tempfile::tempdir().unwrap();
+        let store = Store::new(archive.path(), None);
+        store.write_pack(&pack_meta(1, "p")).unwrap();
+        store.write_pack(&pack_meta(1, "p")).unwrap();
+        let err = store.write_pack(&pack_meta(2, "p")).unwrap_err();
+        assert!(format!("{err:#}").contains("already belongs to"), "{err:#}");
+        assert_eq!(store.load().unwrap()[0].meta, pack_meta(1, "p"));
     }
 
     #[test]

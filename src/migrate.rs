@@ -74,10 +74,16 @@ pub fn legacy_deployment(
             return Some(format!("{} exists", state.display()));
         }
     }
-    let old_archive = std::fs::read_dir(archive_dir).ok()?.flatten().find(|e| {
-        e.file_name()
-            .to_str()
-            .is_some_and(|n| old_archive_name(n).is_some())
+    // The downloads were in the old `--archive-dir`. That is the archive
+    // directory if the option was simply kept, and the cache directory after
+    // an upgrade of the Docker image, where the old cache volume was (and
+    // still is) mounted on /cache while /data and its state.json are gone.
+    let old_archive = [archive_dir, cache_dir].into_iter().find_map(|dir| {
+        std::fs::read_dir(dir).ok()?.flatten().find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| old_archive_name(n).is_some())
+        })
     })?;
     Some(format!(
         "{} is a download from the old layout",

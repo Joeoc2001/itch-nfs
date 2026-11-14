@@ -265,6 +265,15 @@ async fn a_migrated_deployment_keeps_its_names_and_handles() {
     // or --archive-dir still points at the old directory of downloads.
     let why = legacy_deployment(old.archive_dir.path(), cache.path(), None).unwrap();
     assert!(why.contains("download from the old layout"), "{why}");
+    // or, as after an upgrade of the Docker image that kept the old volumes,
+    // the state directory is neither mounted nor configured any more and the
+    // old downloads are in what is now the cache directory, next to a new and
+    // empty archive.
+    let why = legacy_deployment(archive.path(), old.archive_dir.path(), None).unwrap();
+    assert!(why.contains("download from the old layout"), "{why}");
+    let nowhere = archive.path().join("not-created-yet");
+    let why = legacy_deployment(&nowhere, old.archive_dir.path(), None).unwrap();
+    assert!(why.contains("download from the old layout"), "{why}");
     assert_eq!(legacy_deployment(archive.path(), cache.path(), None), None);
 
     let before = (

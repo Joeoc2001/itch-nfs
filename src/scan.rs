@@ -296,11 +296,9 @@ pub struct Scanner {
 
 impl Scanner {
     pub fn new(cfg: ScanConfig, client: ItchClient) -> Result<Self> {
-        // Whatever is in the scratch directory is from a run that died.
+        // Nothing is created or deleted here: a dry run must leave the
+        // scratch directory of a scanner at work alone.
         let scratch = cfg.cache_dir.join("scan-tmp");
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch)
-            .with_context(|| format!("create {}", scratch.display()))?;
         let store = Store::new(&cfg.archive_dir, Some(cfg.cache_dir.join("meta")));
         Ok(Self {
             cfg,
@@ -343,6 +341,14 @@ impl Scanner {
     }
 
     async fn run(&self, dry: bool) -> Result<Report> {
+        if !dry {
+            // Whatever is in the scratch directory is from a pass that died:
+            // there is one scanner, and its passes do not overlap.
+            let _ = tokio::fs::remove_dir_all(&self.scratch).await;
+            tokio::fs::create_dir_all(&self.scratch)
+                .await
+                .with_context(|| format!("create {}", self.scratch.display()))?;
+        }
         let store = self.store.clone();
         let known = tokio::task::spawn_blocking(move || store.load())
             .await?
@@ -446,7 +452,37 @@ impl Scanner {
         };
         let (mut meta, versions) = match known {
             Some(p) => (Some(p.meta), p.versions),
-            None => (None, Vec::new()),
+            None => {
+                // No readable pack.json. If there are committed versions
+                // anyway (pack.json was cut short by a crash), they are not
+                // downloaded again, and pack.json is written again right
+                // away so that they are served.
+                let (store, pack) = (self.store.clone(), name.clone());
+                let versions = match tokio::task::spawn_blocking(move || store.versions(&pack))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|v| v)
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        report
+                            .failed
+                            .push(format!("{name}: could not read the archive: {e:#}"));
+                        return;
+                    }
+                };
+                let mut meta = None;
+                if !versions.is_empty() && !dry {
+                    match self.new_pack(&game, &name, next_pack_no).await {
+                        Ok(m) => meta = Some(m),
+                        Err(e) => {
+                            report.failed.push(format!("{name}: {e:#}"));
+                            return;
+                        }
+                    }
+                }
+                (meta, versions)
+            }
         };
         let mut taken: Vec<String> = versions.iter().map(|v| v.name.clone()).collect();
         let mut next_no = versions.last().map_or(0, |v| v.no);

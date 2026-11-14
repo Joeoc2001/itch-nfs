@@ -5,6 +5,7 @@ mod support;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use itch_nfs::archive::Kind;
 use itch_nfs::store::{Store, VersionMeta, sha256_hex};
@@ -318,6 +319,152 @@ async fn an_interrupted_version_is_redone() {
     );
     assert_eq!(mock.downloads.load(Ordering::SeqCst), 2);
     assert!(paths(&cache.path().join("scan-tmp")).is_empty());
+}
+
+/// `version.json` and `pack.json` are written in place, so a crash can leave
+/// either one empty. The scanner replaces it, once, and downloads no more
+/// than it has to.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_cut_short_by_a_crash_is_repaired() {
+    let mock = Arc::new(Mock::default());
+    for (id, name, date) in [(1, "One.zip", "2024-01-05"), (2, "Two.zip", "2024-02-05")] {
+        mock.uploads.lock().unwrap().insert(
+            id,
+            MockUpload::new(name, date, zip_of(&[("a.png", name.as_bytes())])),
+        );
+    }
+    let addr = support::spawn(mock.clone()).await;
+    let archive = tempfile::tempdir().unwrap();
+    let store = Store::new(archive.path(), None);
+    // Each scanner starts without local copies of the metadata, as after a
+    // crash at that point.
+    let pass = || async {
+        let cache = tempfile::tempdir().unwrap();
+        let before = mock.downloads.load(Ordering::SeqCst);
+        let report = scanner(addr, scan_config(archive.path(), cache.path()))
+            .pass()
+            .await
+            .unwrap();
+        assert_eq!(report.failed, Vec::<String>::new());
+        (
+            report.archived,
+            mock.downloads.load(Ordering::SeqCst) - before,
+        )
+    };
+    let names = ["2024-01-05-one-u1", "2024-02-05-two-u2"];
+    let all = names.map(|n| format!("{PACK}/{n}")).to_vec();
+    let committed = || -> Vec<String> {
+        store
+            .load()
+            .unwrap()
+            .iter()
+            .flat_map(|p| {
+                p.versions
+                    .iter()
+                    .map(|v| format!("{}/{}", p.meta.name, v.name))
+            })
+            .collect()
+    };
+
+    // A crash while pack.json was being created, before any version.
+    std::fs::create_dir_all(store.pack_dir(PACK)).unwrap();
+    std::fs::write(store.pack_dir(PACK).join("pack.json"), b"").unwrap();
+    assert_eq!(pass().await, (all.clone(), 2));
+    assert_eq!(committed(), all, "what was reported as archived is served");
+    assert_eq!(pass().await, (Vec::new(), 0));
+
+    // A crash while a version.json was being created.
+    let marker = store.version_dir(PACK, names[1]).join("version.json");
+    std::fs::write(&marker, b"").unwrap();
+    assert_eq!(committed(), all[..1]);
+    assert_eq!(pass().await, (all[1..].to_vec(), 1));
+    assert_eq!(committed(), all);
+    assert_eq!(pass().await, (Vec::new(), 0));
+
+    // pack.json lost with versions under it: nothing is downloaded again,
+    // and the versions are served again, even though there is nothing new.
+    std::fs::write(store.pack_dir(PACK).join("pack.json"), b"{\"no\": 1,").unwrap();
+    assert!(committed().is_empty());
+    assert_eq!(pass().await, (Vec::new(), 0));
+    assert_eq!(committed(), all);
+    assert_eq!(pass().await, (Vec::new(), 0));
+}
+
+/// A dry run may be made while the scanner is at work with the same cache
+/// directory. It must not delete the downloads in progress.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_leaves_the_scratch_directory_alone() {
+    let mock = Arc::new(Mock::default());
+    *mock.uploads.lock().unwrap() = support::fixture_uploads();
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let in_progress = cache.path().join("scan-tmp/500-1/upload");
+    std::fs::create_dir_all(in_progress.parent().unwrap()).unwrap();
+    std::fs::write(&in_progress, b"half").unwrap();
+
+    let report = scanner(addr, scan_config(archive.path(), cache.path()))
+        .list()
+        .await
+        .unwrap();
+    assert_eq!(report.pending.len(), 5);
+    assert_eq!(std::fs::read(&in_progress).unwrap(), b"half");
+    assert!(paths(archive.path()).is_empty());
+
+    // Nor does it create one.
+    let cache = tempfile::tempdir().unwrap();
+    scanner(addr, scan_config(archive.path(), cache.path()))
+        .list()
+        .await
+        .unwrap();
+    assert!(!cache.path().join("scan-tmp").exists());
+}
+
+/// A download that stops sending fails after the idle timeout, rather than
+/// holding its place in the scan for ever. A slow one that keeps sending is
+/// not cut off, however long it takes in total.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_download_fails_and_a_slow_one_does_not() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Sends the body in 5 pieces, `gap` apart, or only the first of them.
+    async fn serve(stall: bool, gap: Duration) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = conn.read(&mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n";
+                    let _ = conn.write_all(head.as_bytes()).await;
+                    for _ in 0..5 {
+                        let _ = conn.write_all(b"x").await;
+                        if stall {
+                            std::future::pending::<()>().await;
+                        }
+                        tokio::time::sleep(gap).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+    let idle = Duration::from_millis(500);
+    let client = |addr| {
+        itch_nfs::itch::ItchClient::with_idle_timeout(&format!("http://{addr}"), "t".into(), idle)
+            .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("upload");
+
+    let slow = client(serve(false, idle / 2).await);
+    assert_eq!(slow.download(1, 1, &dest).await.unwrap(), 5);
+
+    let stalled = client(serve(true, idle / 2).await);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(idle * 20, stalled.download(1, 1, &dest)).await;
+    let err = result.expect("the download must not hang").unwrap_err();
+    assert!(started.elapsed() >= idle, "{err:#}");
 }
 
 /// A failed upload is reported and retried on the next pass; it does not

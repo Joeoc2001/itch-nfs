@@ -224,10 +224,13 @@ history in `--state-dir` (`/data` in Docker). Two things changed meaning:
 * `--state-dir` / `ITCH_NFS_STATE_DIR`, `--refresh-interval` and the `/data`
   volume are gone, and the binary needs a subcommand (`serve` or `scan`).
 
-`scan` and `serve` refuse to start if they find an old `state.json` (in
-`ITCH_NFS_STATE_DIR`, `./itch-nfs-state`, or the archive or cache directory)
-or old downloads in the archive directory, and the archive has not been
-created yet. Import the old deployment once, with the old server stopped:
+`scan` and `serve` refuse to start if the archive has not been created yet
+and they find an old `state.json` (in `ITCH_NFS_STATE_DIR`,
+`./itch-nfs-state`, or the archive or cache directory) or old downloads
+(`<game id>-<n>.zip` or `.raw`, in the archive or cache directory). The last
+of these is what catches a Docker upgrade that kept the old volumes: the old
+download cache is still mounted on `/cache`. Import the old deployment once,
+with the old server stopped:
 
 ```sh
 itch-nfs migrate \

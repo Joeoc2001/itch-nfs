@@ -11,6 +11,9 @@ use tokio::io::AsyncWriteExt;
 
 pub const DEFAULT_API_URL: &str = "https://api.itch.io";
 
+/// How long a response may send nothing before the request fails.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct ItchClient {
     http: reqwest::Client,
     base: String,
@@ -96,9 +99,20 @@ fn lenient_vec<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(
 
 impl ItchClient {
     pub fn new(base: &str, token: String) -> Result<Self> {
+        Self::with_idle_timeout(base, token, IDLE_TIMEOUT)
+    }
+
+    /// As [`ItchClient::new`], but giving up on a response that sends nothing
+    /// for `idle`.
+    pub fn with_idle_timeout(base: &str, token: String, idle: Duration) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("itch-nfs/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(20))
+            // Bounds the gap between two reads, not the whole response, so
+            // it does not limit how large (or slow) a download may be. A
+            // download has no other timeout, and one that stalled would
+            // otherwise hold its place in the scan for ever.
+            .read_timeout(idle)
             .build()?;
         Ok(Self {
             http,
