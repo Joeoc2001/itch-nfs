@@ -366,7 +366,16 @@ async fn run_migrate(args: MigrateArgs) -> Result<()> {
     if client.is_none() {
         tracing::info!("no itch.io token: versions that were never downloaded stay missing");
     }
-    let report = migrate(&cfg, client.as_ref()).await?;
+    let mut shutdown = Shutdown::new()?;
+    // On a task of its own: importing blocks the task it runs on, which
+    // would otherwise not get to look at the signal until it is done.
+    let work = tokio::spawn(async move { migrate(&cfg, client.as_ref()).await });
+    // Stopping half way is safe: a version without its commit marker is
+    // redone, and what is committed is left alone when migrate is run again.
+    let report = tokio::select! {
+        report = work => report.context("migrate task")??,
+        _ = shutdown.recv() => bail!("interrupted before the migration finished; run migrate again to carry on"),
+    };
     tracing::info!(
         "{} pack(s): {} version(s) imported, {} fetched, {} already in the archive, {} missing",
         report.packs,

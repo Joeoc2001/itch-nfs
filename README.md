@@ -110,6 +110,12 @@ The archive is made for object storage:
 * **Run exactly one scanner per archive.** File locks do not work on such
   mounts, so nothing enforces this. Two scanners would hand the same numbers
   to different packs and versions.
+* Numbers are only given out from a complete view of the archive. If a
+  `version.json` cannot be read (an I/O error, as opposed to the file being
+  missing, empty or cut short), the scanner leaves that pack alone for the
+  pass and reports it as a problem. If a `pack.json` cannot be read, no pack
+  gets a new number in that pass; packs that already have theirs carry on.
+  Both are retried on the next pass.
 
 ## Running
 
@@ -261,6 +267,8 @@ you are happy. Things to know:
   and files of later versions that were hidden as duplicates of it become
   visible.
 * `migrate` can be run again; what is already in the archive is left alone.
+  That includes after it was interrupted: on Ctrl-C or SIGTERM it stops at
+  once and exits with an error, and the version it was working on is redone.
   It refuses an archive that a scanner has already numbered differently, so
   migrate before the first scan.
 
@@ -300,7 +308,8 @@ keeps three things in `--cache-dir` and in memory so that it rarely has to:
   budget. Reading two such zips in turn copies each from the archive again
   every time the reads switch; a warning is logged whenever a file over the
   budget is copied, and the budget should be raised above the largest served
-  file if it appears.
+  file if it appears. A zip the frontend still holds open is closed when its
+  copy is deleted, so the space is given back at once.
 * **Decompressed assets** are cached in memory, dropped `--cache-ttl` seconds
   after their last read, and evicted at random when `--cache-max-mb` is
   exceeded. A single file larger than the whole budget is extracted to
@@ -315,7 +324,9 @@ different archive, give it an empty cache directory.
 The scanner uses `<cache-dir>/scan-tmp` to download and unpack (it needs room
 for the largest upload, unpacked, `--concurrency` times over) and keeps the
 same `meta` copy, so that finding out what is already archived does not read
-the archive either. The two programs can share a cache directory or not.
+the archive either. The copy is only a shortcut: one that is damaged (a power
+loss can leave it empty) is discarded and the file is read from the archive
+again. The two programs can share a cache directory or not.
 
 ## Not supported
 

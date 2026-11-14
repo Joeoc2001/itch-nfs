@@ -166,6 +166,11 @@ impl ItchFs {
         let disk = DiskCache::new(cfg.cache_dir.join("zips"), cfg.disk_cache_max_bytes)?;
         let store = Store::new(&cfg.archive_dir, Some(cfg.cache_dir.join("meta")));
         let mem = MemCache::new(cfg.cache_max_bytes, cfg.cache_ttl);
+        // A zip that is kept open would hold on to the space of its copy
+        // after the copy is evicted.
+        let archives: Arc<Archives> = Default::default();
+        let pool = archives.clone();
+        disk.on_evict(move |path| pool.forget_path(path));
         let fs = ItchFs(Arc::new(Inner {
             cfg,
             store,
@@ -174,7 +179,7 @@ impl ItchFs {
             games: Default::default(),
             mem,
             locks: Default::default(),
-            archives: Default::default(),
+            archives,
             disk,
         }));
         let packs = fs.0.store.load().context("read the archive")?;

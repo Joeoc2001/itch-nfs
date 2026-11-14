@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -149,13 +149,18 @@ const MAX_OPEN: usize = 16;
 /// pack does not re-parse its central directory every time.
 #[derive(Default)]
 pub struct Archives {
-    open: Mutex<HashMap<u64, Arc<Mutex<ZipArchive<File>>>>>,
+    open: Mutex<HashMap<u64, Open>>,
+}
+
+struct Open {
+    path: PathBuf,
+    zip: Arc<Mutex<ZipArchive<File>>>,
 }
 
 impl Archives {
     fn handle(&self, key: u64, path: &Path) -> Result<Arc<Mutex<ZipArchive<File>>>> {
-        if let Some(h) = self.open.lock().unwrap().get(&key) {
-            return Ok(h.clone());
+        if let Some(o) = self.open.lock().unwrap().get(&key) {
+            return Ok(o.zip.clone());
         }
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let h = Arc::new(Mutex::new(
@@ -166,8 +171,20 @@ impl Archives {
             let victim = *open.keys().nth(rand::random_range(0..open.len())).unwrap();
             open.remove(&victim);
         }
-        open.insert(key, h.clone());
+        open.insert(
+            key,
+            Open {
+                path: path.to_path_buf(),
+                zip: h.clone(),
+            },
+        );
         Ok(h)
+    }
+
+    /// Forget every opened archive that was opened from `path`, because the
+    /// file was deleted: an open handle would keep its space allocated.
+    pub fn forget_path(&self, path: &Path) {
+        self.open.lock().unwrap().retain(|_, o| o.path != path);
     }
 
     /// Forget an opened archive (e.g. because its file was replaced).
@@ -211,6 +228,33 @@ impl Archives {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deleted_file_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_at = |name: &str| {
+            let path = dir.path().join(name);
+            let mut w = zip::ZipWriter::new(File::create(&path).unwrap());
+            w.start_file("a", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut w, b"hello").unwrap();
+            w.finish().unwrap();
+            path
+        };
+        let (a, b) = (zip_at("a.zip"), zip_at("b.zip"));
+        let archives = Archives::default();
+        // Two versions served from the same file, and one from another.
+        for (key, path) in [(1, &a), (2, &a), (3, &b)] {
+            let mut out = Vec::new();
+            archives
+                .extract(key, path, 0, 5, crc32fast::hash(b"hello"), &mut out)
+                .unwrap();
+            assert_eq!(out, b"hello");
+        }
+        archives.forget_path(&a);
+        let open = archives.open.lock().unwrap();
+        assert_eq!(open.keys().copied().collect::<Vec<_>>(), [3]);
+    }
 
     #[test]
     fn kind_is_written_lower_case_and_read_either_way() {

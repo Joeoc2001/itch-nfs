@@ -392,6 +392,325 @@ async fn metadata_cut_short_by_a_crash_is_repaired() {
 
 /// A dry run may be made while the scanner is at work with the same cache
 /// directory. It must not delete the downloads in progress.
+/// `(number, name)` of every version.json in a pack directory, read straight
+/// from disk: `Store::load` would hide a number that is used twice.
+fn numbers_on_disk(archive: &Path, pack: &str) -> Vec<(u16, String)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(archive.join("packs").join(pack)).unwrap() {
+        let marker = entry.unwrap().path().join("version.json");
+        if marker.is_file() {
+            let v: VersionMeta = serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
+            found.push((v.no, v.name));
+        }
+    }
+    found.sort();
+    found
+}
+
+fn upload(n: u64) -> MockUpload {
+    MockUpload::new(
+        &format!("U{n}.zip"),
+        &format!("2024-0{n}-05"),
+        zip_of(&[("a.png", format!("upload {n}").as_bytes())]),
+    )
+}
+
+/// The scanner's local copies of version.json can be empty after a power
+/// loss. The versions they stand for are committed all the same: they are
+/// not downloaded again, and their numbers are not given to new uploads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_local_copy_does_not_free_a_version_number() {
+    let mock = Arc::new(Mock::default());
+    for n in [1, 2] {
+        mock.uploads.lock().unwrap().insert(n, upload(n));
+    }
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let scan = scanner(addr, scan_config(archive.path(), cache.path()));
+    let report = scan.pass().await.unwrap();
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(report.archived.len(), 2);
+    // A second pass reads pack.json back, which leaves a local copy of it.
+    assert!(scan.pass().await.unwrap().archived.is_empty());
+
+    // The copies written last are the ones a power loss empties; pack.json
+    // goes the same way.
+    let meta = cache.path().join("meta").join(PACK);
+    for copy in [
+        meta.join("2024-01-05-u1-u1/version.json"),
+        meta.join("2024-02-05-u2-u2/version.json"),
+        meta.join("pack.json"),
+    ] {
+        assert!(copy.is_file(), "{} is cached", copy.display());
+        std::fs::write(copy, b"").unwrap();
+    }
+    // A new upload of this pack and a new pack arrive in the same pass.
+    mock.uploads.lock().unwrap().insert(3, upload(3));
+    mock.games.lock().unwrap().push(MockGame::new(
+        600,
+        "Other Pack",
+        "https://someone.itch.io/other-pack",
+        None,
+    ));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(60, upload(6).of_game(600));
+
+    for pass in 0..3 {
+        let before = mock.downloads.load(Ordering::SeqCst);
+        let report = scan.pass().await.unwrap();
+        assert_eq!(report.failed, Vec::<String>::new(), "pass {pass}");
+        let expected: &[&str] = match pass {
+            0 => &[
+                "creator.tiny-pack/2024-03-05-u3-u3",
+                "someone.other-pack/2024-06-05-u6-u60",
+            ],
+            _ => &[],
+        };
+        assert_eq!(report.archived, expected, "pass {pass}");
+        assert_eq!(
+            mock.downloads.load(Ordering::SeqCst) - before,
+            expected.len(),
+            "pass {pass}: nothing committed is downloaded again"
+        );
+    }
+    assert_eq!(
+        numbers_on_disk(archive.path(), PACK),
+        [
+            (1, "2024-01-05-u1-u1".to_string()),
+            (2, "2024-02-05-u2-u2".to_string()),
+            (3, "2024-03-05-u3-u3".to_string()),
+        ]
+    );
+    let packs: Vec<(u32, String)> = Store::new(archive.path(), None)
+        .load()
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.meta.no, p.meta.name))
+        .collect();
+    assert_eq!(
+        packs,
+        [(1, PACK.to_string()), (2, "someone.other-pack".to_string())]
+    );
+}
+
+/// A version.json that cannot be read (an I/O error on the mount) is not a
+/// version that is not committed. Its pack is left alone for the pass:
+/// nothing is downloaded, and no number is given out that it may hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_version_fails_its_pack_and_frees_no_number() {
+    let mock = Arc::new(Mock::default());
+    mock.games.lock().unwrap().push(MockGame::new(
+        600,
+        "Other Pack",
+        "https://someone.itch.io/other-pack",
+        None,
+    ));
+    mock.uploads.lock().unwrap().insert(1, upload(1));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(60, upload(6).of_game(600));
+    let addr = support::spawn(mock.clone()).await;
+    let archive = tempfile::tempdir().unwrap();
+    // Every pass starts without local copies, like a job with an emptyDir,
+    // so every version.json is read from the archive.
+    let pass = || async {
+        let cache = tempfile::tempdir().unwrap();
+        let before = mock.downloads.load(Ordering::SeqCst);
+        let report = scanner(addr, scan_config(archive.path(), cache.path()))
+            .pass()
+            .await
+            .unwrap();
+        (report, mock.downloads.load(Ordering::SeqCst) - before)
+    };
+    let (report, _) = pass().await;
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(report.archived.len(), 2);
+
+    // A directory in its place makes reading the file fail with something
+    // other than "not found".
+    let marker = archive
+        .path()
+        .join("packs")
+        .join(PACK)
+        .join("2024-01-05-u1-u1/version.json");
+    let aside = archive.path().join("aside");
+    std::fs::rename(&marker, &aside).unwrap();
+    std::fs::create_dir(&marker).unwrap();
+    mock.uploads.lock().unwrap().insert(2, upload(2));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(61, upload(7).of_game(600));
+
+    for _ in 0..2 {
+        let (report, downloads) = pass().await;
+        // The other pack is not held up.
+        let other = ["someone.other-pack/2024-07-05-u7-u61"];
+        let expected = if downloads == 0 {
+            &other[..0]
+        } else {
+            &other[..]
+        };
+        assert_eq!(report.archived, expected);
+        assert!(
+            downloads <= 1,
+            "nothing of the unreadable pack is downloaded"
+        );
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        assert!(
+            report.failed[0].starts_with("creator.tiny-pack: could not read the archive: "),
+            "{:?}",
+            report.failed
+        );
+        assert!(
+            !archive
+                .path()
+                .join("packs")
+                .join(PACK)
+                .join("2024-02-05-u2-u2")
+                .exists()
+        );
+    }
+
+    // The mount recovers.
+    std::fs::remove_dir(&marker).unwrap();
+    std::fs::rename(&aside, &marker).unwrap();
+    let (report, downloads) = pass().await;
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(report.archived, ["creator.tiny-pack/2024-02-05-u2-u2"]);
+    assert_eq!(downloads, 1);
+    assert_eq!(
+        numbers_on_disk(archive.path(), PACK),
+        [
+            (1, "2024-01-05-u1-u1".to_string()),
+            (2, "2024-02-05-u2-u2".to_string()),
+        ]
+    );
+    assert_eq!(
+        numbers_on_disk(archive.path(), "someone.other-pack"),
+        [
+            (1, "2024-06-05-u6-u60".to_string()),
+            (2, "2024-07-05-u7-u61".to_string()),
+        ]
+    );
+}
+
+/// While some pack.json cannot be read, the number it holds is not known,
+/// so no pack is given a number: a new pack waits, before anything of it is
+/// downloaded. Packs that have their number carry on.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_pack_is_numbered_while_a_pack_json_is_unreadable() {
+    let mock = Arc::new(Mock::default());
+    let other = |id: u64, name: &str| {
+        MockGame::new(
+            id,
+            name,
+            &format!("https://someone.itch.io/{}", name.to_lowercase()),
+            None,
+        )
+    };
+    mock.games.lock().unwrap().push(other(600, "Second"));
+    mock.uploads.lock().unwrap().insert(1, upload(1));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(60, upload(6).of_game(600));
+    let addr = support::spawn(mock.clone()).await;
+    let archive = tempfile::tempdir().unwrap();
+    let pass = || async {
+        let cache = tempfile::tempdir().unwrap();
+        let before = mock.downloads.load(Ordering::SeqCst);
+        let mut report = scanner(addr, scan_config(archive.path(), cache.path()))
+            .pass()
+            .await
+            .unwrap();
+        report.failed.sort();
+        (report, mock.downloads.load(Ordering::SeqCst) - before)
+    };
+    let (report, _) = pass().await;
+    assert_eq!(report.failed, Vec::<String>::new());
+    let pack_numbers = || -> Vec<(u32, String)> {
+        Store::new(archive.path(), None)
+            .load()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.meta.no, p.meta.name))
+            .collect()
+    };
+    let second = pack_numbers()
+        .into_iter()
+        .find(|(_, name)| name == "someone.second")
+        .unwrap()
+        .0;
+
+    // The pack.json of "second" cannot be read. A third pack appears, and
+    // both existing packs get a new upload.
+    let pack_json = archive.path().join("packs/someone.second/pack.json");
+    let aside = archive.path().join("aside");
+    std::fs::rename(&pack_json, &aside).unwrap();
+    std::fs::create_dir(&pack_json).unwrap();
+    mock.games.lock().unwrap().push(other(700, "Third"));
+    mock.uploads.lock().unwrap().insert(2, upload(2));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(61, upload(7).of_game(600));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(70, upload(8).of_game(700));
+
+    let (report, downloads) = pass().await;
+    assert_eq!(report.archived, ["creator.tiny-pack/2024-02-05-u2-u2"]);
+    assert_eq!(
+        downloads, 1,
+        "nothing is downloaded for a pack without a number"
+    );
+    assert_eq!(report.failed.len(), 2, "{:?}", report.failed);
+    for (failed, pack) in report
+        .failed
+        .iter()
+        .zip(["someone.second", "someone.third"])
+    {
+        assert!(
+            failed.starts_with(&format!(
+                "{pack}: pack.json of someone.second could not be read"
+            )),
+            "{failed}"
+        );
+    }
+    assert!(!archive.path().join("packs/someone.third").exists());
+
+    // The mount recovers: every pack has a number of its own.
+    std::fs::remove_dir(&pack_json).unwrap();
+    std::fs::rename(&aside, &pack_json).unwrap();
+    let (report, downloads) = pass().await;
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(
+        report.archived,
+        [
+            "someone.second/2024-07-05-u7-u61",
+            "someone.third/2024-08-05-u8-u70"
+        ]
+    );
+    assert_eq!(downloads, 2);
+    let mut numbers = pack_numbers();
+    numbers.sort();
+    assert_eq!(numbers.len(), 3);
+    assert_eq!(numbers[2], (3, "someone.third".to_string()));
+    assert!(numbers.contains(&(second, "someone.second".to_string())));
+    assert_eq!(
+        numbers_on_disk(archive.path(), "someone.second"),
+        [
+            (1, "2024-06-05-u6-u60".to_string()),
+            (2, "2024-07-05-u7-u61".to_string()),
+        ]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn list_leaves_the_scratch_directory_alone() {
     let mock = Arc::new(Mock::default());

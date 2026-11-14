@@ -17,8 +17,8 @@ use crate::ingest::{self, Limits, Outcome};
 use crate::itch::{ItchClient, OwnedGame, Upload};
 use crate::state;
 use crate::store::{
-    CONTENT_FILE, MANIFEST_FILE, MAX_PACKS, Pack, PackMeta, Store, UPLOAD_DIR, VersionMeta,
-    safe_file_name,
+    AlreadyCommitted, CONTENT_FILE, MANIFEST_FILE, MAX_PACKS, NumberTaken, PackMeta, Store,
+    UPLOAD_DIR, VersionMeta, safe_file_name,
 };
 
 /// How many archives-within-archives are unpacked.
@@ -283,8 +283,18 @@ impl VersionPlan {
 struct PackPlan {
     game: OwnedGame,
     name: String,
-    /// What the archive already holds for it.
-    known: Option<Pack>,
+    /// Its `pack.json`, if the archive has a readable one.
+    meta: Option<PackMeta>,
+    /// Every version the archive holds for it, or why that is not known.
+    versions: Result<Vec<VersionMeta>, String>,
+}
+
+/// Where pack numbers come from during a pass.
+struct PackNumbers {
+    next: u32,
+    /// Why no number may be given out in this pass: some `pack.json` could
+    /// not be read, and it may hold any number.
+    blocked: Option<String>,
 }
 
 pub struct Scanner {
@@ -349,10 +359,46 @@ impl Scanner {
                 .await
                 .with_context(|| format!("create {}", self.scratch.display()))?;
         }
+        // Numbers are given out from this view of the archive, so it has to
+        // be complete: what could not be read is not "not archived".
         let store = self.store.clone();
-        let known = tokio::task::spawn_blocking(move || store.load())
+        let surveyed = tokio::task::spawn_blocking(move || store.survey())
             .await?
             .context("read the archive")?;
+        let mut numbers = PackNumbers {
+            next: 1,
+            blocked: None,
+        };
+        // The packs with a readable pack.json, as `Store::load` picks them.
+        let mut known: Vec<&PackMeta> = Vec::new();
+        for dir in &surveyed {
+            match &dir.meta {
+                Ok(Some(meta)) => {
+                    numbers.next = numbers.next.max(meta.no + 1);
+                    match known
+                        .iter()
+                        .find(|k| k.no == meta.no || k.game_id == meta.game_id)
+                    {
+                        Some(other) => warn!(
+                            "ignoring pack {}: it has the number or game id of {}",
+                            dir.name, other.name
+                        ),
+                        None => known.push(meta),
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("pack {}: {e:#}", dir.name);
+                    numbers.blocked.get_or_insert_with(|| {
+                        format!(
+                            "{} of {} could not be read, so no pack can be numbered in this pass",
+                            crate::store::PACK_FILE,
+                            dir.name
+                        )
+                    });
+                }
+            }
+        }
         let owned = self
             .client
             .owned_games()
@@ -361,7 +407,7 @@ impl Scanner {
 
         // Names are settled here, one pack after the other, so that they do
         // not depend on the order the packs happen to be scanned in.
-        let mut names: HashSet<String> = known.iter().map(|p| p.meta.name.clone()).collect();
+        let mut names: HashSet<String> = known.iter().map(|p| p.name.clone()).collect();
         let mut seen = HashSet::new();
         let mut plans = Vec::new();
         let mut skipped = 0;
@@ -373,9 +419,9 @@ impl Scanner {
                 skipped += 1;
                 continue;
             }
-            let pack = known.iter().find(|p| p.meta.game_id == game.game_id);
-            let name = match pack {
-                Some(p) => p.meta.name.clone(),
+            let meta = known.iter().find(|p| p.game_id == game.game_id).copied();
+            let name = match meta {
+                Some(p) => p.name.clone(),
                 None => {
                     let mut name = state::game_dir_name(&game.url, game.game_id);
                     if names.contains(&name) {
@@ -385,10 +431,20 @@ impl Scanner {
                     name
                 }
             };
+            // Without a readable pack.json the directory of that name is
+            // still this pack's: its versions are not downloaded again.
+            let versions = match surveyed.iter().find(|d| d.name == name) {
+                Some(dir) => match &dir.versions {
+                    Ok(v) => Ok(v.clone()),
+                    Err(e) => Err(format!("{e:#}")),
+                },
+                None => Ok(Vec::new()),
+            };
             plans.push(PackPlan {
                 game,
                 name,
-                known: pack.cloned(),
+                meta: meta.cloned(),
+                versions,
             });
         }
         if skipped > 0 {
@@ -407,7 +463,7 @@ impl Scanner {
         }
         report.packs = plans.len();
 
-        let next_pack_no = Mutex::new(known.iter().map(|p| p.meta.no).max().unwrap_or(0) + 1);
+        let next_pack_no = Mutex::new(numbers);
         let report = Mutex::new(report);
         futures_util::stream::iter(plans)
             .for_each_concurrent(self.cfg.concurrency.max(1), |plan| {
@@ -437,10 +493,26 @@ impl Scanner {
         &self,
         plan: PackPlan,
         dry: bool,
-        next_pack_no: &Mutex<u32>,
+        next_pack_no: &Mutex<PackNumbers>,
         report: &mut Report,
     ) {
-        let PackPlan { game, name, known } = plan;
+        let PackPlan {
+            game,
+            name,
+            mut meta,
+            versions,
+        } = plan;
+        // Checked before anything else: with an incomplete list of versions,
+        // committed ones would be downloaded again and their numbers reused.
+        let versions = match versions {
+            Ok(v) => v,
+            Err(e) => {
+                report
+                    .failed
+                    .push(format!("{name}: could not read the archive: {e}"));
+                return;
+            }
+        };
         let uploads = match self.client.uploads(game.game_id, game.key_id).await {
             Ok(u) => u,
             Err(e) => {
@@ -450,42 +522,16 @@ impl Scanner {
                 return;
             }
         };
-        let (mut meta, versions) = match known {
-            Some(p) => (Some(p.meta), p.versions),
-            None => {
-                // No readable pack.json. If there are committed versions
-                // anyway (pack.json was cut short by a crash), they are not
-                // downloaded again, and pack.json is written again right
-                // away so that they are served.
-                let (store, pack) = (self.store.clone(), name.clone());
-                let versions = match tokio::task::spawn_blocking(move || store.versions(&pack))
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|v| v)
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        report
-                            .failed
-                            .push(format!("{name}: could not read the archive: {e:#}"));
-                        return;
-                    }
-                };
-                let mut meta = None;
-                if !versions.is_empty() && !dry {
-                    match self.new_pack(&game, &name, next_pack_no).await {
-                        Ok(m) => meta = Some(m),
-                        Err(e) => {
-                            report.failed.push(format!("{name}: {e:#}"));
-                            return;
-                        }
-                    }
-                }
-                (meta, versions)
-            }
-        };
         let mut taken: Vec<String> = versions.iter().map(|v| v.name.clone()).collect();
         let mut next_no = versions.last().map_or(0, |v| v.no);
+        for pair in versions.windows(2) {
+            if pair[0].no == pair[1].no {
+                warn!(
+                    "{name}: {} and {} are both version {}, only the first is served",
+                    pair[0].name, pair[1].name, pair[0].no
+                );
+            }
+        }
         let mut new: Vec<VersionPlan> = uploads
             .iter()
             .filter(|u| {
@@ -497,6 +543,28 @@ impl Scanner {
             .collect();
         // Oldest first: later versions are de-duplicated against earlier ones.
         new.sort_by_key(|v| (v.timestamp, v.upload_id));
+
+        if meta.is_none() && (!versions.is_empty() || !new.is_empty()) {
+            // The pack needs a number. Find out whether it can have one
+            // before downloading anything.
+            let blocked = next_pack_no.lock().unwrap().blocked.clone();
+            if let Some(why) = blocked {
+                report.failed.push(format!("{name}: {why}"));
+                return;
+            }
+            // Committed versions without a readable pack.json (it was cut
+            // short by a crash) are not downloaded again, and pack.json is
+            // written again right away so that they are served.
+            if !versions.is_empty() && !dry {
+                match self.new_pack(&game, &name, next_pack_no).await {
+                    Ok(m) => meta = Some(m),
+                    Err(e) => {
+                        report.failed.push(format!("{name}: {e:#}"));
+                        return;
+                    }
+                }
+            }
+        }
 
         for mut v in new {
             let Some(no) = next_no.checked_add(1) else {
@@ -543,8 +611,22 @@ impl Scanner {
                     taken.push(done.name);
                     next_no = no;
                 }
-                // The number and the name stay free for the next pass.
-                Err(e) => report.failed.push(format!("{name}/{}: {e:#}", v.name)),
+                Err(e) => {
+                    let stale = e
+                        .chain()
+                        .any(|c| c.is::<AlreadyCommitted>() || c.is::<NumberTaken>());
+                    report.failed.push(format!("{name}/{}: {e:#}", v.name));
+                    if stale {
+                        // The archive holds a version this pass did not know
+                        // of, so which numbers are free is not known either.
+                        report.failed.push(format!(
+                            "{name}: the archive is not as it was read, leaving the pack for the next pass"
+                        ));
+                        break;
+                    }
+                    // Otherwise the number and the name stay free: nothing
+                    // was committed under them.
+                }
             }
         }
     }
@@ -554,15 +636,18 @@ impl Scanner {
         &self,
         game: &OwnedGame,
         name: &str,
-        next_pack_no: &Mutex<u32>,
+        next_pack_no: &Mutex<PackNumbers>,
     ) -> Result<PackMeta> {
         let no = {
-            let mut next = next_pack_no.lock().unwrap();
-            if *next > MAX_PACKS {
+            let mut numbers = next_pack_no.lock().unwrap();
+            if let Some(why) = &numbers.blocked {
+                bail!("{why}");
+            }
+            if numbers.next > MAX_PACKS {
                 bail!("too many packs");
             }
-            *next += 1;
-            *next - 1
+            numbers.next += 1;
+            numbers.next - 1
         };
         let meta = PackMeta {
             no,

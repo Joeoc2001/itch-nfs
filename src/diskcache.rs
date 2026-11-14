@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use tracing::{debug, warn};
@@ -31,7 +31,11 @@ struct Inner {
     state: Mutex<State>,
     locks: KeyedLocks<String>,
     copies: AtomicU64,
+    /// Called with the path of each copy that eviction deleted.
+    on_evict: OnceLock<EvictHook>,
 }
+
+type EvictHook = Box<dyn Fn(&Path) + Send + Sync>;
 
 #[derive(Default)]
 struct State {
@@ -98,10 +102,14 @@ impl Inner {
             let entry = st.entries.remove(&key).unwrap();
             st.bytes -= entry.size;
             debug!("evicting {key} ({} bytes) from the disk cache", entry.size);
-            if let Err(e) = std::fs::remove_file(self.dir.join(&key))
+            let path = self.dir.join(&key);
+            if let Err(e) = std::fs::remove_file(&path)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 warn!("could not remove {key} from the disk cache: {e}");
+            }
+            if let Some(hook) = self.on_evict.get() {
+                hook(&path);
             }
         }
     }
@@ -172,6 +180,7 @@ impl DiskCache {
             state: Mutex::new(State::default()),
             locks: KeyedLocks::default(),
             copies: AtomicU64::new(0),
+            on_evict: OnceLock::new(),
         };
         inner.evict(&mut st);
         *inner.state.lock().unwrap() = st;
@@ -241,6 +250,16 @@ impl DiskCache {
             key: sha256.to_string(),
             inner: self.0.clone(),
         })
+    }
+
+    /// Have `hook` called with the path of every copy that is evicted from
+    /// now on, right after it was deleted. Whoever keeps such files open has
+    /// to close them there: a deleted file that is still open keeps its
+    /// space, and the cache would be over its budget without knowing it. The
+    /// hook runs inside the cache and must not call back into it. Only the
+    /// first hook set is kept.
+    pub fn on_evict(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        let _ = self.0.on_evict.set(Box::new(hook));
     }
 
     /// How many times a file has been read from the archive (successfully or not).
@@ -393,6 +412,26 @@ mod tests {
         c.get(&huge, 300, &sha_huge).await.unwrap();
         assert_eq!(names(cache.path()), [sha_huge]);
         assert_eq!(c.bytes(), 300);
+    }
+
+    #[tokio::test]
+    async fn eviction_is_announced() {
+        let (src, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let c = DiskCache::new(cache.path(), 100).unwrap();
+        let evicted = Arc::new(Mutex::new(Vec::new()));
+        let seen = evicted.clone();
+        c.on_evict(move |path| {
+            assert!(!path.exists(), "called after the copy is deleted");
+            seen.lock().unwrap().push(path.to_path_buf());
+        });
+        let (a, _, sha_a) = source(src.path(), "a", 1, 80);
+        let (b, _, sha_b) = source(src.path(), "b", 2, 80);
+        let held = c.get(&a, 80, &sha_a).await.unwrap();
+        let a_path = held.path().to_path_buf();
+        c.get(&b, 80, &sha_b).await.unwrap();
+        assert!(evicted.lock().unwrap().is_empty(), "a is still in use");
+        drop(held);
+        assert_eq!(*evicted.lock().unwrap(), [a_path]);
     }
 
     #[tokio::test]
