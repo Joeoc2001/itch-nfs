@@ -1,0 +1,1197 @@
+//! The scanner against a mock itch.io API: what ends up in the archive.
+
+mod support;
+
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use itch_nfs::archive::Kind;
+use itch_nfs::store::{Store, VersionMeta, sha256_hex};
+use support::{GAME, Mock, MockGame, MockUpload, scan_config, scanner, snapshot, zip_of};
+
+const PACK: &str = "creator.tiny-pack";
+
+fn paths(dir: &Path) -> Vec<String> {
+    snapshot(dir).into_keys().collect()
+}
+
+fn versions(archive: &Path, pack: &str) -> Vec<VersionMeta> {
+    Store::new(archive, None)
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.meta.name == pack)
+        .map(|p| p.versions)
+        .unwrap_or_default()
+}
+
+/// After one pass every upload of every pack is in the archive, in the
+/// documented layout, without any client having browsed anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_pass_archives_every_upload_of_every_pack() {
+    let mock = Arc::new(Mock::default());
+    *mock.uploads.lock().unwrap() = support::fixture_uploads();
+    // A second pack by another creator, which nobody will ever browse.
+    mock.games.lock().unwrap().push(MockGame::new(
+        600,
+        "Other Pack",
+        "https://someone.itch.io/other-pack",
+        Some("assets"),
+    ));
+    mock.uploads.lock().unwrap().insert(
+        60,
+        MockUpload::new("Other.zip", "2024-07-01", zip_of(&[("o.png", b"oooo")])).of_game(600),
+    );
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let scan = scanner(addr, scan_config(archive.path(), cache.path()));
+
+    let report = scan.pass().await.unwrap();
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(report.packs, 2);
+    assert_eq!(
+        report.archived,
+        [
+            "creator.tiny-pack/2024-01-05-tiny-pack-v1-u1",
+            "creator.tiny-pack/2024-02-05-tiny-pack-v2-u2",
+            "creator.tiny-pack/2024-03-05-tiny-docs-u3",
+            "creator.tiny-pack/2024-04-05-tiny-extras-u4",
+            "creator.tiny-pack/2024-05-05-tiny-manual-u5",
+            "someone.other-pack/2024-07-01-other-u60",
+        ]
+    );
+    assert_eq!(mock.downloads.load(Ordering::SeqCst), 6);
+
+    // The layout: the original upload always; content.zip only when the
+    // upload is not already a plain zip; nothing else (no temporary files).
+    assert_eq!(
+        paths(archive.path()),
+        [
+            // A zip, but with archives nested in it: flattened.
+            "packs/creator.tiny-pack/2024-01-05-tiny-pack-v1-u1/content.zip",
+            "packs/creator.tiny-pack/2024-01-05-tiny-pack-v1-u1/manifest.json",
+            "packs/creator.tiny-pack/2024-01-05-tiny-pack-v1-u1/upload/Tiny Pack v1.zip",
+            "packs/creator.tiny-pack/2024-01-05-tiny-pack-v1-u1/version.json",
+            "packs/creator.tiny-pack/2024-02-05-tiny-pack-v2-u2/content.zip",
+            "packs/creator.tiny-pack/2024-02-05-tiny-pack-v2-u2/manifest.json",
+            "packs/creator.tiny-pack/2024-02-05-tiny-pack-v2-u2/upload/Tiny Pack v2.7z",
+            "packs/creator.tiny-pack/2024-02-05-tiny-pack-v2-u2/version.json",
+            "packs/creator.tiny-pack/2024-03-05-tiny-docs-u3/content.zip",
+            "packs/creator.tiny-pack/2024-03-05-tiny-docs-u3/manifest.json",
+            "packs/creator.tiny-pack/2024-03-05-tiny-docs-u3/upload/Tiny Docs.rar",
+            "packs/creator.tiny-pack/2024-03-05-tiny-docs-u3/version.json",
+            "packs/creator.tiny-pack/2024-04-05-tiny-extras-u4/content.zip",
+            "packs/creator.tiny-pack/2024-04-05-tiny-extras-u4/manifest.json",
+            "packs/creator.tiny-pack/2024-04-05-tiny-extras-u4/upload/Tiny Extras.tar.bz2",
+            "packs/creator.tiny-pack/2024-04-05-tiny-extras-u4/version.json",
+            // Not an archive: served as it is.
+            "packs/creator.tiny-pack/2024-05-05-tiny-manual-u5/manifest.json",
+            "packs/creator.tiny-pack/2024-05-05-tiny-manual-u5/upload/Tiny Manual.pdf",
+            "packs/creator.tiny-pack/2024-05-05-tiny-manual-u5/version.json",
+            "packs/creator.tiny-pack/pack.json",
+            // A plain zip: served as it is, no content.zip.
+            "packs/someone.other-pack/2024-07-01-other-u60/manifest.json",
+            "packs/someone.other-pack/2024-07-01-other-u60/upload/Other.zip",
+            "packs/someone.other-pack/2024-07-01-other-u60/version.json",
+            "packs/someone.other-pack/pack.json",
+        ]
+    );
+    assert!(
+        paths(&cache.path().join("scan-tmp")).is_empty(),
+        "scratch space is cleaned up"
+    );
+
+    // The archive describes itself: names, numbers, what to serve, checksums.
+    let store = Store::new(archive.path(), None);
+    let packs = store.load().unwrap();
+    assert_eq!(packs.len(), 2);
+    let mut numbers: Vec<u32> = packs.iter().map(|p| p.meta.no).collect();
+    numbers.sort();
+    assert_eq!(numbers, [1, 2]);
+    let tiny = packs.iter().find(|p| p.meta.name == PACK).unwrap();
+    assert_eq!(tiny.meta.game_id, GAME);
+    assert_eq!(tiny.meta.title, "Tiny Pack");
+    assert_eq!(tiny.meta.url, "https://creator.itch.io/tiny-pack");
+    let uploads = support::fixture_uploads();
+    for (i, v) in tiny.versions.iter().enumerate() {
+        let original = &uploads[&v.upload_id];
+        assert_eq!(v.no as usize, i + 1, "numbered oldest first");
+        assert_eq!(v.filename, original.filename);
+        assert_eq!(v.fingerprint, support::mock_md5(&original.data));
+        assert_eq!(v.size, Some(original.data.len() as u64));
+        // The original upload, byte for byte.
+        let upload = v.file(v.upload.as_ref().unwrap()).unwrap();
+        assert_eq!(upload.path, format!("upload/{}", original.filename));
+        assert_eq!(upload.sha256, sha256_hex(&original.data));
+        assert_eq!(
+            std::fs::read(store.file_path(PACK, &v.name, upload)).unwrap(),
+            original.data
+        );
+        // Every recorded checksum is that of the file in the archive.
+        for f in &v.files {
+            let bytes = std::fs::read(store.file_path(PACK, &v.name, f)).unwrap();
+            assert_eq!(
+                (bytes.len() as u64, sha256_hex(&bytes)),
+                (f.size, f.sha256.clone())
+            );
+        }
+        assert_eq!(v.note, None);
+    }
+    let serve: Vec<(Kind, &str)> = tiny
+        .versions
+        .iter()
+        .map(|v| (v.kind, v.serve.as_str()))
+        .collect();
+    assert_eq!(
+        serve,
+        [
+            (Kind::Zip, "content.zip"),
+            (Kind::Zip, "content.zip"),
+            (Kind::Zip, "content.zip"),
+            (Kind::Zip, "content.zip"),
+            (Kind::Raw, "upload/Tiny Manual.pdf"),
+        ]
+    );
+    let other = &packs
+        .iter()
+        .find(|p| p.meta.name == "someone.other-pack")
+        .unwrap()
+        .versions[0];
+    assert_eq!(
+        (other.kind, other.serve.as_str()),
+        (Kind::Zip, "upload/Other.zip")
+    );
+
+    // A second pass, and a second scanner starting from nothing but the
+    // archive (no cache directory), download nothing twice and write nothing.
+    let before = snapshot(archive.path());
+    let report = scan.pass().await.unwrap();
+    assert!(report.archived.is_empty() && report.failed.is_empty());
+    let fresh_cache = tempfile::tempdir().unwrap();
+    let report = scanner(addr, scan_config(archive.path(), fresh_cache.path()))
+        .pass()
+        .await
+        .unwrap();
+    assert!(report.archived.is_empty() && report.failed.is_empty());
+    assert_eq!(mock.downloads.load(Ordering::SeqCst), 6);
+    assert_eq!(snapshot(archive.path()), before);
+}
+
+/// The archive is write-once: a later pass only adds files. Nothing that
+/// exists is rewritten, replaced (which is what a rename would do) or removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_upload_becomes_a_new_version_and_nothing_is_rewritten() {
+    let mock = Arc::new(Mock::default());
+    mock.uploads.lock().unwrap().insert(
+        1,
+        MockUpload::new("Tiny.zip", "2024-01-05", zip_of(&[("a.png", b"aaaa")])),
+    );
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let scan = scanner(addr, scan_config(archive.path(), cache.path()));
+    scan.pass().await.unwrap();
+    let before = snapshot(archive.path());
+    assert_eq!(before.len(), 4);
+
+    // The creator replaces the file behind upload 1, deletes nothing else,
+    // and adds a tarball as upload 2.
+    mock.uploads.lock().unwrap().insert(
+        1,
+        MockUpload::new("Tiny.zip", "2024-01-05", zip_of(&[("a.png", b"AAAA")])),
+    );
+    mock.uploads.lock().unwrap().insert(
+        2,
+        MockUpload::new(
+            "More.tar.gz",
+            "2024-02-01",
+            support::tar_gz_of(&[("m.png", b"mmmm")]),
+        ),
+    );
+    let report = scan.pass().await.unwrap();
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(
+        report.archived,
+        [
+            // Same upload id, same name, same date: told apart by a suffix.
+            "creator.tiny-pack/2024-01-05-tiny-u1-2",
+            "creator.tiny-pack/2024-02-01-more-u2",
+        ]
+    );
+    let vs = versions(archive.path(), PACK);
+    let numbered: Vec<(u16, &str)> = vs.iter().map(|v| (v.no, v.name.as_str())).collect();
+    assert_eq!(
+        numbered,
+        [
+            (1, "2024-01-05-tiny-u1"),
+            (2, "2024-01-05-tiny-u1-2"),
+            (3, "2024-02-01-more-u2"),
+        ]
+    );
+    assert_ne!(vs[0].fingerprint, vs[1].fingerprint);
+
+    let after = snapshot(archive.path());
+    for (path, stamp) in &before {
+        assert_eq!(after.get(path), Some(stamp), "{path} was touched");
+    }
+    let added: Vec<&str> = after
+        .keys()
+        .filter(|p| !before.contains_key(*p))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        added,
+        [
+            "packs/creator.tiny-pack/2024-01-05-tiny-u1-2/manifest.json",
+            "packs/creator.tiny-pack/2024-01-05-tiny-u1-2/upload/Tiny.zip",
+            "packs/creator.tiny-pack/2024-01-05-tiny-u1-2/version.json",
+            "packs/creator.tiny-pack/2024-02-01-more-u2/content.zip",
+            "packs/creator.tiny-pack/2024-02-01-more-u2/manifest.json",
+            "packs/creator.tiny-pack/2024-02-01-more-u2/upload/More.tar.gz",
+            "packs/creator.tiny-pack/2024-02-01-more-u2/version.json",
+        ]
+    );
+    // version.json is the commit marker: nothing in a version is written after it.
+    for v in ["2024-01-05-tiny-u1-2", "2024-02-01-more-u2"] {
+        let dir = format!("packs/creator.tiny-pack/{v}/");
+        let marker = after[&format!("{dir}version.json")].mtime;
+        for (path, stamp) in after.iter().filter(|(p, _)| p.starts_with(&dir)) {
+            assert!(stamp.mtime <= marker, "{path} was written after the marker");
+        }
+    }
+}
+
+/// A version that was being written when the scanner died has no commit
+/// marker. The next pass redoes it, under the same name and number.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_version_is_redone() {
+    let mock = Arc::new(Mock::default());
+    let data = zip_of(&[("a.png", b"aaaa")]);
+    mock.uploads.lock().unwrap().insert(
+        1,
+        MockUpload::new(
+            "Tiny.7z",
+            "2024-01-05",
+            support::sevenz_of(&[("a.png", b"aaaa")]),
+        ),
+    );
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(2, MockUpload::new("Two.zip", "2024-02-05", data.clone()));
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+
+    // What an interrupted pass leaves: pack.json, and some of the files of
+    // the first version (one of them cut short), but no version.json.
+    let store = Store::new(archive.path(), None);
+    let dir = store.version_dir(PACK, "2024-01-05-tiny-u1");
+    std::fs::create_dir_all(dir.join("upload")).unwrap();
+    std::fs::write(dir.join("upload/Tiny.7z"), b"7z\xbc\xaf half an upl").unwrap();
+    std::fs::write(dir.join("stale.tmp"), b"junk").unwrap();
+    // And scratch files of the dead run.
+    std::fs::create_dir_all(cache.path().join("scan-tmp/500-1")).unwrap();
+    std::fs::write(cache.path().join("scan-tmp/500-1/upload"), b"half").unwrap();
+    assert!(versions(archive.path(), PACK).is_empty());
+
+    let scan = scanner(addr, scan_config(archive.path(), cache.path()));
+    let report = scan.pass().await.unwrap();
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(report.archived.len(), 2);
+    let vs = versions(archive.path(), PACK);
+    assert_eq!((vs[0].no, vs[0].name.as_str()), (1, "2024-01-05-tiny-u1"));
+    assert_eq!((vs[1].no, vs[1].name.as_str()), (2, "2024-02-05-two-u2"));
+    assert_eq!(
+        paths(&dir),
+        [
+            "content.zip",
+            "manifest.json",
+            "upload/Tiny.7z",
+            "version.json"
+        ],
+        "the leftovers are gone"
+    );
+    let upload = vs[0].file("upload/Tiny.7z").unwrap();
+    assert_eq!(
+        upload.sha256,
+        sha256_hex(&mock.uploads.lock().unwrap()[&1].data)
+    );
+    assert_eq!(mock.downloads.load(Ordering::SeqCst), 2);
+    assert!(paths(&cache.path().join("scan-tmp")).is_empty());
+}
+
+/// `version.json` and `pack.json` are written in place, so a crash can leave
+/// either one empty. The scanner replaces it, once, and downloads no more
+/// than it has to.
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_cut_short_by_a_crash_is_repaired() {
+    let mock = Arc::new(Mock::default());
+    for (id, name, date) in [(1, "One.zip", "2024-01-05"), (2, "Two.zip", "2024-02-05")] {
+        mock.uploads.lock().unwrap().insert(
+            id,
+            MockUpload::new(name, date, zip_of(&[("a.png", name.as_bytes())])),
+        );
+    }
+    let addr = support::spawn(mock.clone()).await;
+    let archive = tempfile::tempdir().unwrap();
+    let store = Store::new(archive.path(), None);
+    // Each scanner starts without local copies of the metadata, as after a
+    // crash at that point.
+    let pass = || async {
+        let cache = tempfile::tempdir().unwrap();
+        let before = mock.downloads.load(Ordering::SeqCst);
+        let report = scanner(addr, scan_config(archive.path(), cache.path()))
+            .pass()
+            .await
+            .unwrap();
+        assert_eq!(report.failed, Vec::<String>::new());
+        (
+            report.archived,
+            mock.downloads.load(Ordering::SeqCst) - before,
+        )
+    };
+    let names = ["2024-01-05-one-u1", "2024-02-05-two-u2"];
+    let all = names.map(|n| format!("{PACK}/{n}")).to_vec();
+    let committed = || -> Vec<String> {
+        store
+            .load()
+            .unwrap()
+            .iter()
+            .flat_map(|p| {
+                p.versions
+                    .iter()
+                    .map(|v| format!("{}/{}", p.meta.name, v.name))
+            })
+            .collect()
+    };
+
+    // A crash while pack.json was being created, before any version.
+    std::fs::create_dir_all(store.pack_dir(PACK)).unwrap();
+    std::fs::write(store.pack_dir(PACK).join("pack.json"), b"").unwrap();
+    assert_eq!(pass().await, (all.clone(), 2));
+    assert_eq!(committed(), all, "what was reported as archived is served");
+    assert_eq!(pass().await, (Vec::new(), 0));
+
+    // A crash while a version.json was being created.
+    let marker = store.version_dir(PACK, names[1]).join("version.json");
+    std::fs::write(&marker, b"").unwrap();
+    assert_eq!(committed(), all[..1]);
+    assert_eq!(pass().await, (all[1..].to_vec(), 1));
+    assert_eq!(committed(), all);
+    assert_eq!(pass().await, (Vec::new(), 0));
+
+    // pack.json lost with versions under it: nothing is downloaded again,
+    // and the versions are served again, even though there is nothing new.
+    std::fs::write(store.pack_dir(PACK).join("pack.json"), b"{\"no\": 1,").unwrap();
+    assert!(committed().is_empty());
+    assert_eq!(pass().await, (Vec::new(), 0));
+    assert_eq!(committed(), all);
+    assert_eq!(pass().await, (Vec::new(), 0));
+}
+
+/// A dry run may be made while the scanner is at work with the same cache
+/// directory. It must not delete the downloads in progress.
+/// `(number, name)` of every version.json in a pack directory, read straight
+/// from disk: `Store::load` would hide a number that is used twice.
+fn numbers_on_disk(archive: &Path, pack: &str) -> Vec<(u16, String)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(archive.join("packs").join(pack)).unwrap() {
+        let marker = entry.unwrap().path().join("version.json");
+        if marker.is_file() {
+            let v: VersionMeta = serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
+            found.push((v.no, v.name));
+        }
+    }
+    found.sort();
+    found
+}
+
+fn upload(n: u64) -> MockUpload {
+    MockUpload::new(
+        &format!("U{n}.zip"),
+        &format!("2024-0{n}-05"),
+        zip_of(&[("a.png", format!("upload {n}").as_bytes())]),
+    )
+}
+
+/// The scanner's local copies of version.json can be empty after a power
+/// loss. The versions they stand for are committed all the same: they are
+/// not downloaded again, and their numbers are not given to new uploads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_damaged_local_copy_does_not_free_a_version_number() {
+    let mock = Arc::new(Mock::default());
+    for n in [1, 2] {
+        mock.uploads.lock().unwrap().insert(n, upload(n));
+    }
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let scan = scanner(addr, scan_config(archive.path(), cache.path()));
+    let report = scan.pass().await.unwrap();
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(report.archived.len(), 2);
+    // A second pass reads pack.json back, which leaves a local copy of it.
+    assert!(scan.pass().await.unwrap().archived.is_empty());
+
+    // The copies written last are the ones a power loss empties; pack.json
+    // goes the same way.
+    let meta = cache.path().join("meta").join(PACK);
+    for copy in [
+        meta.join("2024-01-05-u1-u1/version.json"),
+        meta.join("2024-02-05-u2-u2/version.json"),
+        meta.join("pack.json"),
+    ] {
+        assert!(copy.is_file(), "{} is cached", copy.display());
+        std::fs::write(copy, b"").unwrap();
+    }
+    // A new upload of this pack and a new pack arrive in the same pass.
+    mock.uploads.lock().unwrap().insert(3, upload(3));
+    mock.games.lock().unwrap().push(MockGame::new(
+        600,
+        "Other Pack",
+        "https://someone.itch.io/other-pack",
+        None,
+    ));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(60, upload(6).of_game(600));
+
+    for pass in 0..3 {
+        let before = mock.downloads.load(Ordering::SeqCst);
+        let report = scan.pass().await.unwrap();
+        assert_eq!(report.failed, Vec::<String>::new(), "pass {pass}");
+        let expected: &[&str] = match pass {
+            0 => &[
+                "creator.tiny-pack/2024-03-05-u3-u3",
+                "someone.other-pack/2024-06-05-u6-u60",
+            ],
+            _ => &[],
+        };
+        assert_eq!(report.archived, expected, "pass {pass}");
+        assert_eq!(
+            mock.downloads.load(Ordering::SeqCst) - before,
+            expected.len(),
+            "pass {pass}: nothing committed is downloaded again"
+        );
+    }
+    assert_eq!(
+        numbers_on_disk(archive.path(), PACK),
+        [
+            (1, "2024-01-05-u1-u1".to_string()),
+            (2, "2024-02-05-u2-u2".to_string()),
+            (3, "2024-03-05-u3-u3".to_string()),
+        ]
+    );
+    let packs: Vec<(u32, String)> = Store::new(archive.path(), None)
+        .load()
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.meta.no, p.meta.name))
+        .collect();
+    assert_eq!(
+        packs,
+        [(1, PACK.to_string()), (2, "someone.other-pack".to_string())]
+    );
+}
+
+/// A version.json that cannot be read (an I/O error on the mount) is not a
+/// version that is not committed. Its pack is left alone for the pass:
+/// nothing is downloaded, and no number is given out that it may hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_version_fails_its_pack_and_frees_no_number() {
+    let mock = Arc::new(Mock::default());
+    mock.games.lock().unwrap().push(MockGame::new(
+        600,
+        "Other Pack",
+        "https://someone.itch.io/other-pack",
+        None,
+    ));
+    mock.uploads.lock().unwrap().insert(1, upload(1));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(60, upload(6).of_game(600));
+    let addr = support::spawn(mock.clone()).await;
+    let archive = tempfile::tempdir().unwrap();
+    // Every pass starts without local copies, like a job with an emptyDir,
+    // so every version.json is read from the archive.
+    let pass = || async {
+        let cache = tempfile::tempdir().unwrap();
+        let before = mock.downloads.load(Ordering::SeqCst);
+        let report = scanner(addr, scan_config(archive.path(), cache.path()))
+            .pass()
+            .await
+            .unwrap();
+        (report, mock.downloads.load(Ordering::SeqCst) - before)
+    };
+    let (report, _) = pass().await;
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(report.archived.len(), 2);
+
+    // A directory in its place makes reading the file fail with something
+    // other than "not found".
+    let marker = archive
+        .path()
+        .join("packs")
+        .join(PACK)
+        .join("2024-01-05-u1-u1/version.json");
+    let aside = archive.path().join("aside");
+    std::fs::rename(&marker, &aside).unwrap();
+    std::fs::create_dir(&marker).unwrap();
+    mock.uploads.lock().unwrap().insert(2, upload(2));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(61, upload(7).of_game(600));
+
+    for _ in 0..2 {
+        let (report, downloads) = pass().await;
+        // The other pack is not held up.
+        let other = ["someone.other-pack/2024-07-05-u7-u61"];
+        let expected = if downloads == 0 {
+            &other[..0]
+        } else {
+            &other[..]
+        };
+        assert_eq!(report.archived, expected);
+        assert!(
+            downloads <= 1,
+            "nothing of the unreadable pack is downloaded"
+        );
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        assert!(
+            report.failed[0].starts_with("creator.tiny-pack: could not read the archive: "),
+            "{:?}",
+            report.failed
+        );
+        assert!(
+            !archive
+                .path()
+                .join("packs")
+                .join(PACK)
+                .join("2024-02-05-u2-u2")
+                .exists()
+        );
+    }
+
+    // The mount recovers.
+    std::fs::remove_dir(&marker).unwrap();
+    std::fs::rename(&aside, &marker).unwrap();
+    let (report, downloads) = pass().await;
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(report.archived, ["creator.tiny-pack/2024-02-05-u2-u2"]);
+    assert_eq!(downloads, 1);
+    assert_eq!(
+        numbers_on_disk(archive.path(), PACK),
+        [
+            (1, "2024-01-05-u1-u1".to_string()),
+            (2, "2024-02-05-u2-u2".to_string()),
+        ]
+    );
+    assert_eq!(
+        numbers_on_disk(archive.path(), "someone.other-pack"),
+        [
+            (1, "2024-06-05-u6-u60".to_string()),
+            (2, "2024-07-05-u7-u61".to_string()),
+        ]
+    );
+}
+
+/// While some pack.json cannot be read, the number it holds is not known,
+/// so no pack is given a number: a new pack waits, before anything of it is
+/// downloaded. Packs that have their number carry on.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_pack_is_numbered_while_a_pack_json_is_unreadable() {
+    let mock = Arc::new(Mock::default());
+    let other = |id: u64, name: &str| {
+        MockGame::new(
+            id,
+            name,
+            &format!("https://someone.itch.io/{}", name.to_lowercase()),
+            None,
+        )
+    };
+    mock.games.lock().unwrap().push(other(600, "Second"));
+    mock.uploads.lock().unwrap().insert(1, upload(1));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(60, upload(6).of_game(600));
+    let addr = support::spawn(mock.clone()).await;
+    let archive = tempfile::tempdir().unwrap();
+    let pass = || async {
+        let cache = tempfile::tempdir().unwrap();
+        let before = mock.downloads.load(Ordering::SeqCst);
+        let mut report = scanner(addr, scan_config(archive.path(), cache.path()))
+            .pass()
+            .await
+            .unwrap();
+        report.failed.sort();
+        (report, mock.downloads.load(Ordering::SeqCst) - before)
+    };
+    let (report, _) = pass().await;
+    assert_eq!(report.failed, Vec::<String>::new());
+    let pack_numbers = || -> Vec<(u32, String)> {
+        Store::new(archive.path(), None)
+            .load()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.meta.no, p.meta.name))
+            .collect()
+    };
+    let second = pack_numbers()
+        .into_iter()
+        .find(|(_, name)| name == "someone.second")
+        .unwrap()
+        .0;
+
+    // The pack.json of "second" cannot be read. A third pack appears, and
+    // both existing packs get a new upload.
+    let pack_json = archive.path().join("packs/someone.second/pack.json");
+    let aside = archive.path().join("aside");
+    std::fs::rename(&pack_json, &aside).unwrap();
+    std::fs::create_dir(&pack_json).unwrap();
+    mock.games.lock().unwrap().push(other(700, "Third"));
+    mock.uploads.lock().unwrap().insert(2, upload(2));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(61, upload(7).of_game(600));
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(70, upload(8).of_game(700));
+
+    let (report, downloads) = pass().await;
+    assert_eq!(report.archived, ["creator.tiny-pack/2024-02-05-u2-u2"]);
+    assert_eq!(
+        downloads, 1,
+        "nothing is downloaded for a pack without a number"
+    );
+    assert_eq!(report.failed.len(), 2, "{:?}", report.failed);
+    for (failed, pack) in report
+        .failed
+        .iter()
+        .zip(["someone.second", "someone.third"])
+    {
+        assert!(
+            failed.starts_with(&format!(
+                "{pack}: pack.json of someone.second could not be read"
+            )),
+            "{failed}"
+        );
+    }
+    assert!(!archive.path().join("packs/someone.third").exists());
+
+    // The mount recovers: every pack has a number of its own.
+    std::fs::remove_dir(&pack_json).unwrap();
+    std::fs::rename(&aside, &pack_json).unwrap();
+    let (report, downloads) = pass().await;
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(
+        report.archived,
+        [
+            "someone.second/2024-07-05-u7-u61",
+            "someone.third/2024-08-05-u8-u70"
+        ]
+    );
+    assert_eq!(downloads, 2);
+    let mut numbers = pack_numbers();
+    numbers.sort();
+    assert_eq!(numbers.len(), 3);
+    assert_eq!(numbers[2], (3, "someone.third".to_string()));
+    assert!(numbers.contains(&(second, "someone.second".to_string())));
+    assert_eq!(
+        numbers_on_disk(archive.path(), "someone.second"),
+        [
+            (1, "2024-06-05-u6-u60".to_string()),
+            (2, "2024-07-05-u7-u61".to_string()),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_leaves_the_scratch_directory_alone() {
+    let mock = Arc::new(Mock::default());
+    *mock.uploads.lock().unwrap() = support::fixture_uploads();
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let in_progress = cache.path().join("scan-tmp/500-1/upload");
+    std::fs::create_dir_all(in_progress.parent().unwrap()).unwrap();
+    std::fs::write(&in_progress, b"half").unwrap();
+
+    let report = scanner(addr, scan_config(archive.path(), cache.path()))
+        .list()
+        .await
+        .unwrap();
+    assert_eq!(report.pending.len(), 5);
+    assert_eq!(std::fs::read(&in_progress).unwrap(), b"half");
+    assert!(paths(archive.path()).is_empty());
+
+    // Nor does it create one.
+    let cache = tempfile::tempdir().unwrap();
+    scanner(addr, scan_config(archive.path(), cache.path()))
+        .list()
+        .await
+        .unwrap();
+    assert!(!cache.path().join("scan-tmp").exists());
+}
+
+/// A download that stops sending fails after the idle timeout, rather than
+/// holding its place in the scan for ever. A slow one that keeps sending is
+/// not cut off, however long it takes in total.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_download_fails_and_a_slow_one_does_not() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Sends the body in 5 pieces, `gap` apart, or only the first of them.
+    async fn serve(stall: bool, gap: Duration) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = conn.read(&mut buf).await;
+                    let head = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\n";
+                    let _ = conn.write_all(head.as_bytes()).await;
+                    for _ in 0..5 {
+                        let _ = conn.write_all(b"x").await;
+                        if stall {
+                            std::future::pending::<()>().await;
+                        }
+                        tokio::time::sleep(gap).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+    let idle = Duration::from_millis(500);
+    let client = |addr| {
+        itch_nfs::itch::ItchClient::with_idle_timeout(&format!("http://{addr}"), "t".into(), idle)
+            .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("upload");
+
+    let slow = client(serve(false, idle / 2).await);
+    assert_eq!(slow.download(1, 1, &dest).await.unwrap(), 5);
+
+    let stalled = client(serve(true, idle / 2).await);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(idle * 20, stalled.download(1, 1, &dest)).await;
+    let err = result.expect("the download must not hang").unwrap_err();
+    assert!(started.elapsed() >= idle, "{err:#}");
+}
+
+/// A failed upload is reported and retried on the next pass; it does not
+/// stop the pack's other uploads or the other packs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_upload_is_retried_and_blocks_nothing_else() {
+    let mock = Arc::new(Mock::default());
+    mock.games.lock().unwrap().push(MockGame::new(
+        600,
+        "Other Pack",
+        "https://someone.itch.io/other-pack",
+        None,
+    ));
+    {
+        let mut u = mock.uploads.lock().unwrap();
+        u.insert(
+            1,
+            MockUpload::new("One.zip", "2024-01-05", zip_of(&[("a", b"1")])),
+        );
+        u.insert(
+            2,
+            MockUpload::new("Two.zip", "2024-02-05", zip_of(&[("b", b"2")])),
+        );
+        u.insert(
+            60,
+            MockUpload::new("Other.zip", "2024-07-01", zip_of(&[("o", b"o")])).of_game(600),
+        );
+    }
+    mock.broken.lock().unwrap().insert(1);
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let scan = scanner(addr, scan_config(archive.path(), cache.path()));
+
+    let report = scan.pass().await.unwrap();
+    assert_eq!(
+        report.archived,
+        [
+            "creator.tiny-pack/2024-02-05-two-u2",
+            "someone.other-pack/2024-07-01-other-u60"
+        ]
+    );
+    assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+    assert!(
+        report.failed[0].starts_with("creator.tiny-pack/2024-01-05-one-u1: "),
+        "{:?}",
+        report.failed
+    );
+    assert!(
+        !archive
+            .path()
+            .join("packs/creator.tiny-pack/2024-01-05-one-u1/version.json")
+            .exists()
+    );
+    assert!(paths(&cache.path().join("scan-tmp")).is_empty());
+
+    // itch.io recovers: the next pass archives it. Versions are numbered in
+    // the order they were committed.
+    mock.broken.lock().unwrap().clear();
+    let report = scan.pass().await.unwrap();
+    assert_eq!(report.archived, ["creator.tiny-pack/2024-01-05-one-u1"]);
+    assert!(report.failed.is_empty());
+    let numbered: Vec<(u16, String)> = versions(archive.path(), PACK)
+        .into_iter()
+        .map(|v| (v.no, v.name))
+        .collect();
+    assert_eq!(
+        numbered,
+        [
+            (1, "2024-02-05-two-u2".to_string()),
+            (2, "2024-01-05-one-u1".to_string())
+        ]
+    );
+    // 3 in the first pass (one of them failed), 1 in the second.
+    assert_eq!(mock.downloads.load(Ordering::SeqCst), 4);
+}
+
+/// The library cannot be listed: the pass fails as a whole, and says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_api_fails_the_pass() {
+    let mock = Arc::new(Mock::default());
+    let (addr, server) = support::spawn_stoppable(mock.clone()).await;
+    server.abort();
+    let _ = server.await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let err = scanner(addr, scan_config(archive.path(), cache.path()))
+        .pass()
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("list owned packs"), "{err:#}");
+    assert!(paths(archive.path()).is_empty());
+}
+
+/// `--list` prints what would be archived and downloads nothing; `--only`
+/// restricts a scan to named packs.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_downloads_nothing_and_only_restricts_the_scan() {
+    let mock = Arc::new(Mock::default());
+    *mock.uploads.lock().unwrap() = support::fixture_uploads();
+    mock.games.lock().unwrap().push(MockGame::new(
+        600,
+        "Other Pack",
+        "https://someone.itch.io/other-pack",
+        None,
+    ));
+    mock.uploads.lock().unwrap().insert(
+        60,
+        MockUpload::new("Other.zip", "2024-07-01", zip_of(&[("o.png", b"oooo")])).of_game(600),
+    );
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+
+    let report = scanner(addr, scan_config(archive.path(), cache.path()))
+        .list()
+        .await
+        .unwrap();
+    assert_eq!(report.packs, 2);
+    let pending: Vec<(&str, &str, &str, Option<u64>)> = report
+        .pending
+        .iter()
+        .map(|p| {
+            (
+                p.pack.as_str(),
+                p.version.as_str(),
+                p.filename.as_str(),
+                p.size,
+            )
+        })
+        .collect();
+    let sizes = support::fixture_uploads();
+    let size = |id: u64| Some(sizes[&id].data.len() as u64);
+    let other_size = Some(zip_of(&[("o.png", b"oooo")]).len() as u64);
+    assert_eq!(
+        pending,
+        [
+            (
+                PACK,
+                "2024-01-05-tiny-pack-v1-u1",
+                "Tiny Pack v1.zip",
+                size(1)
+            ),
+            (
+                PACK,
+                "2024-02-05-tiny-pack-v2-u2",
+                "Tiny Pack v2.7z",
+                size(2)
+            ),
+            (PACK, "2024-03-05-tiny-docs-u3", "Tiny Docs.rar", size(3)),
+            (
+                PACK,
+                "2024-04-05-tiny-extras-u4",
+                "Tiny Extras.tar.bz2",
+                size(4)
+            ),
+            (
+                PACK,
+                "2024-05-05-tiny-manual-u5",
+                "Tiny Manual.pdf",
+                size(5)
+            ),
+            (
+                "someone.other-pack",
+                "2024-07-01-other-u60",
+                "Other.zip",
+                other_size
+            ),
+        ]
+    );
+    assert_eq!(
+        mock.downloads.load(Ordering::SeqCst),
+        0,
+        "a dry run downloads nothing"
+    );
+    assert!(paths(archive.path()).is_empty(), "a dry run writes nothing");
+
+    // Only the other pack.
+    let mut cfg = scan_config(archive.path(), cache.path());
+    cfg.only = vec!["someone.other-pack".into()];
+    let report = scanner(addr, cfg).pass().await.unwrap();
+    assert_eq!(report.packs, 1);
+    assert_eq!(report.archived, ["someone.other-pack/2024-07-01-other-u60"]);
+    assert_eq!(mock.downloads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        Store::new(archive.path(), None).load().unwrap().len(),
+        1,
+        "the pack that was not asked for is not in the archive"
+    );
+
+    // What is archived is no longer listed.
+    let report = scanner(addr, scan_config(archive.path(), cache.path()))
+        .list()
+        .await
+        .unwrap();
+    assert_eq!(report.pending.len(), 5);
+    assert!(report.pending.iter().all(|p| p.pack == PACK));
+
+    // A name that matches nothing is a reported problem, not a silent no-op.
+    let mut cfg = scan_config(archive.path(), cache.path());
+    cfg.only = vec!["no.such-pack".into()];
+    let report = scanner(addr, cfg).pass().await.unwrap();
+    assert_eq!(report.packs, 0);
+    assert_eq!(report.failed, ["no.such-pack: no such pack in the library"]);
+    assert_eq!(mock.downloads.load(Ordering::SeqCst), 1);
+}
+
+/// By default only asset packs are archived, not the games the account owns.
+#[tokio::test(flavor = "multi_thread")]
+async fn classification_decides_what_is_in_scope() {
+    let mock = Arc::new(Mock::default());
+    {
+        let mut games = mock.games.lock().unwrap();
+        games.clear();
+        games.push(MockGame::new(
+            1,
+            "Assets",
+            "https://a.itch.io/assets",
+            Some("assets"),
+        ));
+        games.push(MockGame::new(
+            2,
+            "A Game",
+            "https://a.itch.io/a-game",
+            Some("game"),
+        ));
+        games.push(MockGame::new(
+            3,
+            "Music",
+            "https://a.itch.io/music",
+            Some("soundtrack"),
+        ));
+        // The API says nothing about this one: it is not left out on a guess.
+        games.push(MockGame::new(
+            4,
+            "Unknown",
+            "https://a.itch.io/unknown",
+            None,
+        ));
+        let mut u = mock.uploads.lock().unwrap();
+        for id in 1..=4u64 {
+            let body = zip_of(&[("f", id.to_string().as_bytes())]);
+            u.insert(id, MockUpload::new("f.zip", "2024-01-05", body).of_game(id));
+        }
+    }
+    let addr = support::spawn(mock.clone()).await;
+    let names = |archive: &Path| -> Vec<String> {
+        let mut n: Vec<String> = Store::new(archive, None)
+            .load()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.meta.name)
+            .collect();
+        n.sort();
+        n
+    };
+
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut cfg = scan_config(archive.path(), cache.path());
+    cfg.classifications = vec!["assets".into()];
+    let report = scanner(addr, cfg).pass().await.unwrap();
+    assert_eq!(report.packs, 2);
+    assert_eq!(names(archive.path()), ["a.assets", "a.unknown"]);
+    assert_eq!(mock.downloads.load(Ordering::SeqCst), 2);
+
+    let mut cfg = scan_config(archive.path(), cache.path());
+    cfg.classifications = vec!["assets".into(), "Soundtrack".into()];
+    scanner(addr, cfg).pass().await.unwrap();
+    assert_eq!(names(archive.path()), ["a.assets", "a.music", "a.unknown"]);
+
+    // No filter: everything, games included. Pack numbers follow the order
+    // packs were first archived in, and never change.
+    let cfg = scan_config(archive.path(), cache.path());
+    scanner(addr, cfg).pass().await.unwrap();
+    assert_eq!(
+        names(archive.path()),
+        ["a.a-game", "a.assets", "a.music", "a.unknown"]
+    );
+    let mut numbers: Vec<(u32, String)> = Store::new(archive.path(), None)
+        .load()
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.meta.no, p.meta.name))
+        .collect();
+    numbers.sort();
+    assert_eq!(numbers[2], (3, "a.music".to_string()));
+    assert_eq!(numbers[3], (4, "a.a-game".to_string()));
+    assert_eq!(mock.downloads.load(Ordering::SeqCst), 4);
+}
+
+/// An upload over the unpacking limit is still archived, and served as the
+/// upload itself, with the reason on record.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_over_the_limit_is_archived_as_a_single_file() {
+    let mock = Arc::new(Mock::default());
+    let big = vec![0u8; 200_000];
+    let bomb = support::tar_gz_of(&[("a", &big), ("b", &big), ("c", &big)]);
+    {
+        let mut u = mock.uploads.lock().unwrap();
+        u.insert(
+            1,
+            MockUpload::new("Bomb.tar.gz", "2024-01-05", bomb.clone()),
+        );
+        u.insert(
+            2,
+            MockUpload::new("Fine.zip", "2024-02-05", zip_of(&[("a", b"1")])),
+        );
+    }
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut cfg = scan_config(archive.path(), cache.path());
+    cfg.max_unpacked_bytes = 500_000;
+    let report = scanner(addr, cfg).pass().await.unwrap();
+    assert_eq!(report.failed, Vec::<String>::new());
+    assert_eq!(report.archived.len(), 2);
+
+    let vs = versions(archive.path(), PACK);
+    assert_eq!(vs[0].kind, Kind::Raw);
+    assert_eq!(vs[0].serve, "upload/Bomb.tar.gz");
+    let note = vs[0].note.as_deref().unwrap();
+    assert!(
+        note.contains("more than the limit of 500000 bytes"),
+        "{note}"
+    );
+    assert_eq!(
+        paths(&archive.path().join("packs").join(PACK).join(&vs[0].name)),
+        ["manifest.json", "upload/Bomb.tar.gz", "version.json"]
+    );
+    assert_eq!(
+        std::fs::read(
+            archive
+                .path()
+                .join("packs")
+                .join(PACK)
+                .join(&vs[0].name)
+                .join("upload/Bomb.tar.gz")
+        )
+        .unwrap(),
+        bomb
+    );
+    assert_eq!((vs[1].kind, vs[1].note.as_deref()), (Kind::Zip, None));
+}
+
+/// The file behind an upload id is replaced while it is being downloaded.
+/// What was downloaded no longer matches what itch.io describes, so it is not
+/// archived under the old description; the next pass archives the new file.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_replaced_mid_download_is_not_archived_as_the_old_one() {
+    let mock = Arc::new(Mock::default());
+    let old = zip_of(&[("a.png", b"old!")]);
+    let new = zip_of(&[("a.png", b"new!"), ("b.png", b"more")]);
+    mock.uploads
+        .lock()
+        .unwrap()
+        .insert(1, MockUpload::new("Tiny.zip", "2024-01-05", old));
+    mock.swap_on_download
+        .lock()
+        .unwrap()
+        .insert(1, MockUpload::new("Tiny.zip", "2024-03-01", new.clone()));
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let scan = scanner(addr, scan_config(archive.path(), cache.path()));
+
+    let report = scan.pass().await.unwrap();
+    assert!(report.archived.is_empty());
+    assert_eq!(report.failed.len(), 1);
+    assert!(
+        report.failed[0].contains("changed while it was downloaded"),
+        "{:?}",
+        report.failed
+    );
+    assert!(versions(archive.path(), PACK).is_empty());
+
+    let report = scan.pass().await.unwrap();
+    assert_eq!(report.archived, ["creator.tiny-pack/2024-03-01-tiny-u1"]);
+    let vs = versions(archive.path(), PACK);
+    assert_eq!(vs.len(), 1);
+    assert_eq!(vs[0].no, 1);
+    assert_eq!(
+        vs[0].file("upload/Tiny.zip").unwrap().sha256,
+        sha256_hex(&new)
+    );
+}
+
+/// Requests to itch.io are spaced out, however many packs are scanned at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_are_paced() {
+    let mock = Arc::new(Mock::default());
+    for id in 2..=5u64 {
+        mock.games.lock().unwrap().push(MockGame::new(
+            id,
+            "P",
+            &format!("https://c.itch.io/p{id}"),
+            None,
+        ));
+    }
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut cfg = scan_config(archive.path(), cache.path());
+    cfg.concurrency = 5;
+    let delay = std::time::Duration::from_millis(40);
+    let scan = itch_nfs::scan::Scanner::new(cfg, support::client(addr).with_delay(delay)).unwrap();
+    let started = std::time::Instant::now();
+    let report = scan.pass().await.unwrap();
+    assert_eq!(report.packs, 5);
+    // Two pages of owned keys, then one uploads call per pack.
+    let requests = mock.requests.load(Ordering::SeqCst) as u32;
+    assert_eq!(requests, 7);
+    assert!(
+        started.elapsed() >= delay * (requests - 1),
+        "{requests} requests took only {:?}",
+        started.elapsed()
+    );
+}

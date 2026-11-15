@@ -1,9 +1,12 @@
-//! The virtual filesystem: `/<pack>/<version>/<archive contents>`.
+//! The frontend's virtual filesystem: `/<pack>/<version>/<archive contents>`,
+//! served from the archive directory.
+//!
+//! Nothing here talks to itch.io, and nothing here writes to the archive.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -12,38 +15,36 @@ use nfsserve::nfs::*;
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tracing::{info, warn};
 
-use crate::archive::{self, Archives, Manifest};
+use crate::archive::{self, Archives, Kind};
 use crate::cache::{KeyedLocks, MemCache};
-use crate::ingest::{self, Limits, Outcome};
-use crate::itch::{ItchClient, Upload};
-use crate::state::{self, GameState, State, VersionState};
+use crate::diskcache::{Cached, DiskCache};
+use crate::store::{Pack, PackMeta, Store, VersionMeta};
 use crate::tree::{NodeKind, Seen, Source, Tree};
 
 pub struct Config {
-    /// Durable: the version history and file listings.
-    pub state_dir: PathBuf,
-    /// Disposable: downloaded archives.
+    /// The durable archive the scanner writes. Only ever read here.
     pub archive_dir: PathBuf,
+    /// Local and disposable: copies of the archive's metadata and zips, and
+    /// extracted files too large for memory.
+    pub cache_dir: PathBuf,
+    /// Budget for decompressed assets held in memory.
     pub cache_max_bytes: u64,
     pub cache_ttl: Duration,
-    pub refresh_interval: Duration,
-    /// Cap on the decompressed size of a single upload.
-    pub max_unpacked_bytes: u64,
+    /// How often the archive is listed for newly committed versions.
+    pub rescan_interval: Duration,
+    /// Budget for the local copies of the archive's zips.
+    pub disk_cache_max_bytes: u64,
 }
-
-/// How many archives-within-archives are unpacked.
-const MAX_ARCHIVE_DEPTH: u32 = 8;
 
 /// Largest READ served at once, matching the `rtmax` nfsserve advertises.
 /// Clients may ask for more, and the export is unauthenticated, so without a
 /// cap one request could make the server allocate up to 4 GiB.
 const MAX_READ: u32 = 1024 * 1024;
 
-const ERROR_BACKOFF: Duration = Duration::from_secs(30);
-
 /// File ids: 20 bits pack number, 16 bits version number, 28 bits tree node.
-/// They are derived from persisted numbering only, so they (and the NFS file
-/// handles made from them) stay valid across server restarts.
+/// The numbers are recorded in the archive (`pack.json`, `version.json`), so
+/// the ids (and the NFS file handles made from them) stay valid across
+/// restarts, and across the loss of everything but the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Id {
     Root,
@@ -82,43 +83,47 @@ impl Id {
     }
 }
 
-/// Runtime (non-persisted) data for one pack.
-#[derive(Default)]
-struct GameRt {
-    refresh: tokio::sync::Mutex<Refresh>,
-    /// Trees of versions 1..=len, loaded in order because each one is
-    /// de-duplicated against all of its predecessors.
-    trees: RwLock<Vec<Arc<Tree>>>,
-    load: tokio::sync::Mutex<Seen>,
+/// A pack with at least one committed version.
+struct PackEntry {
+    meta: PackMeta,
+    versions: BTreeMap<u16, Arc<VersionMeta>>,
+    /// The directory's mtime, which is what makes NFS clients re-read it:
+    /// when the newest version was archived, and never going backwards.
+    changed_at: i64,
 }
 
+/// What the archive holds, by pack number.
 #[derive(Default)]
-struct Refresh {
-    next: Option<Instant>,
-    /// What itch currently serves for each upload id: (build id, fingerprint).
-    /// `None` until the uploads have been listed successfully.
-    current: Option<HashMap<u64, (Option<u64>, String)>>,
+struct Tables {
+    packs: BTreeMap<u32, PackEntry>,
+    /// The root's mtime; changes whenever a pack appears.
+    changed_at: i64,
+}
+
+/// Lazily built data for one pack.
+#[derive(Default)]
+struct GameRt {
+    /// Trees of the pack's first versions, in version number order. Always a
+    /// prefix, because each is de-duplicated against all of its predecessors.
+    trees: RwLock<BTreeMap<u16, Arc<Tree>>>,
+    /// Everything in the versions that `trees` covers.
+    load: tokio::sync::Mutex<Seen>,
 }
 
 struct Inner {
     cfg: Config,
-    client: ItchClient,
-    state: Mutex<State>,
-    library_next: tokio::sync::Mutex<Option<Instant>>,
+    store: Store,
+    tables: RwLock<Tables>,
+    rescan: tokio::sync::Mutex<()>,
     games: Mutex<HashMap<u32, Arc<GameRt>>>,
     mem: MemCache<u64>,
     locks: KeyedLocks<u64>,
     archives: Arc<Archives>,
+    disk: DiskCache,
 }
 
 #[derive(Clone)]
 pub struct ItchFs(Arc<Inner>);
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-}
 
 fn io_err(e: anyhow::Error) -> nfsstat3 {
     warn!("{e:#}");
@@ -150,403 +155,217 @@ fn attr(id: u64, dir: bool, size: u64, mtime: i64) -> fattr3 {
     }
 }
 
-fn fingerprint(u: &Upload) -> String {
-    if u.build_id.is_some() {
-        return String::new(); // the build id says it all
-    }
-    match &u.md5_hash {
-        Some(h) if !h.is_empty() => h.clone(),
-        _ => format!(
-            "{}|{}",
-            u.updated_at.as_deref().unwrap_or(""),
-            u.size.unwrap_or(0)
-        ),
-    }
-}
-
 impl ItchFs {
-    pub fn new(cfg: Config, client: ItchClient) -> Result<Self> {
-        std::fs::create_dir_all(cfg.state_dir.join("manifests"))
-            .with_context(|| format!("create {}", cfg.state_dir.display()))?;
+    /// Open the archive and load what it holds. An archive that does not
+    /// exist yet (the scanner has not run) is an empty export, not an error.
+    pub fn new(cfg: Config) -> Result<Self> {
         // Extracted oversized files are only valid for this process.
-        for scratch in ["spill", "tmp"] {
-            let dir = cfg.archive_dir.join(scratch);
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        }
-        let state = State::load(&cfg.state_dir)?;
+        let spill = cfg.cache_dir.join("spill");
+        let _ = std::fs::remove_dir_all(&spill);
+        std::fs::create_dir_all(&spill).with_context(|| format!("create {}", spill.display()))?;
+        let disk = DiskCache::new(cfg.cache_dir.join("zips"), cfg.disk_cache_max_bytes)?;
+        let store = Store::new(&cfg.archive_dir, Some(cfg.cache_dir.join("meta")));
         let mem = MemCache::new(cfg.cache_max_bytes, cfg.cache_ttl);
-        Ok(ItchFs(Arc::new(Inner {
+        // A zip that is kept open would hold on to the space of its copy
+        // after the copy is evicted.
+        let archives: Arc<Archives> = Default::default();
+        let pool = archives.clone();
+        disk.on_evict(move |path| pool.forget_path(path));
+        let fs = ItchFs(Arc::new(Inner {
             cfg,
-            client,
-            state: Mutex::new(state),
-            library_next: Default::default(),
+            store,
+            tables: Default::default(),
+            rescan: Default::default(),
             games: Default::default(),
             mem,
             locks: Default::default(),
-            archives: Default::default(),
-        })))
+            archives,
+            disk,
+        }));
+        let packs = fs.0.store.load().context("read the archive")?;
+        fs.merge(packs, false);
+        let (packs, versions) = {
+            let t = fs.0.tables.read().unwrap();
+            (
+                t.packs.len(),
+                t.packs.values().map(|p| p.versions.len()).sum::<usize>(),
+            )
+        };
+        info!(
+            "{} holds {versions} version(s) of {packs} pack(s)",
+            fs.0.cfg.archive_dir.display()
+        );
+        Ok(fs)
     }
 
-    /// Background upkeep: expire cached assets, and poll itch.io for new packs
-    /// and new versions. Polling matters beyond freshness: NFS clients only
-    /// re-read a directory when its mtime changes, so discovery cannot rely on
-    /// client requests alone.
+    /// Background upkeep: expire cached assets, and list the archive for
+    /// newly committed versions.
     pub async fn run_maintenance(&self) {
         let sweep =
             (self.0.cfg.cache_ttl / 2).clamp(Duration::from_secs(1), Duration::from_secs(60));
         let mut sweep = tokio::time::interval(sweep);
-        let mut refresh =
-            tokio::time::interval(self.0.cfg.refresh_interval.max(Duration::from_secs(1)));
+        let every = self.0.cfg.rescan_interval.max(Duration::from_secs(1));
+        let mut rescan = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         loop {
             tokio::select! {
                 _ = sweep.tick() => self.0.mem.purge_expired(),
-                _ = refresh.tick() => self.refresh_all().await,
+                _ = rescan.tick() => {
+                    if let Err(e) = self.rescan().await {
+                        warn!("could not rescan the archive, serving what is known: {e:#}");
+                    }
+                }
             }
         }
     }
 
-    /// Refresh the library, and every pack that has been browsed before.
-    pub async fn refresh_all(&self) {
-        self.ensure_library(true).await;
-        let tracked: Vec<u32> = {
-            let st = self.0.state.lock().unwrap();
-            st.games
-                .iter()
-                .filter(|(_, g)| !g.versions.is_empty() && g.key_id.is_some())
-                .map(|(no, _)| *no)
-                .collect()
-        };
-        for no in tracked {
-            self.ensure_game(no, true).await;
+    /// Pick up packs and versions committed since the last look. Costs one
+    /// directory listing per pack, and one read per new metadata file.
+    pub async fn rescan(&self) -> Result<()> {
+        let _guard = self.0.rescan.lock().await;
+        let store = self.0.store.clone();
+        let packs = tokio::task::spawn_blocking(move || store.load()).await??;
+        self.merge(packs, true);
+        Ok(())
+    }
+
+    /// Add what is new in `packs` to the tables, logging it if `announce`.
+    /// Nothing is ever removed or changed: the archive is write-once, and
+    /// handles must stay valid.
+    fn merge(&self, packs: Vec<Pack>, announce: bool) {
+        let mut t = self.0.tables.write().unwrap();
+        let mut new_packs: Option<i64> = None;
+        for p in packs {
+            // A pack appears once it has a committed version.
+            if p.versions.is_empty() {
+                continue;
+            }
+            let no = p.meta.no;
+            let fresh = !t.packs.contains_key(&no);
+            let entry = t.packs.entry(no).or_insert_with(|| PackEntry {
+                meta: p.meta.clone(),
+                versions: BTreeMap::new(),
+                changed_at: 0,
+            });
+            if entry.meta != p.meta {
+                warn!(
+                    "ignoring pack {}: its number is {}'s",
+                    p.meta.name, entry.meta.name
+                );
+                continue;
+            }
+            let mut added: Option<i64> = None;
+            for v in p.versions {
+                if entry.versions.contains_key(&v.no) {
+                    continue;
+                }
+                if entry
+                    .versions
+                    .keys()
+                    .next_back()
+                    .is_some_and(|&last| v.no < last)
+                {
+                    // Should not happen (versions are numbered in the order
+                    // they are committed), but later versions are
+                    // de-duplicated against this one: rebuild their trees.
+                    warn!(
+                        "{}/{} appeared with a lower number than existing versions",
+                        entry.meta.name, v.name
+                    );
+                    self.0.games.lock().unwrap().remove(&no);
+                }
+                if announce {
+                    info!("new version: {}/{}", entry.meta.name, v.name);
+                }
+                added = Some(added.unwrap_or(i64::MIN).max(v.archived_at));
+                entry.versions.insert(v.no, Arc::new(v));
+            }
+            if let Some(at) = added {
+                entry.changed_at = at.max(entry.changed_at + 1);
+                if fresh {
+                    new_packs = Some(new_packs.unwrap_or(i64::MIN).max(at));
+                }
+            }
         }
+        if let Some(at) = new_packs {
+            t.changed_at = at.max(t.changed_at + 1);
+        }
+    }
+
+    /// How many times a file has been copied out of the archive directory.
+    pub fn archive_reads(&self) -> u64 {
+        self.0.disk.copies()
     }
 
     fn rt(&self, no: u32) -> Arc<GameRt> {
         self.0.games.lock().unwrap().entry(no).or_default().clone()
     }
 
-    fn save_state(&self, st: &State) {
-        if let Err(e) = st.save(&self.0.cfg.state_dir) {
-            warn!("failed to persist state: {e:#}");
-        }
-    }
-
-    /// Sync the list of owned packs, unless done recently.
-    async fn ensure_library(&self, force: bool) {
-        let mut next = self.0.library_next.lock().await;
-        if !force && next.is_some_and(|t| Instant::now() < t) {
-            return;
-        }
-        let owned = match self.0.client.owned_games().await {
-            Ok(o) => o,
-            Err(e) => {
-                warn!("could not list owned packs, serving known ones: {e:#}");
-                *next = Some(Instant::now() + ERROR_BACKOFF.min(self.0.cfg.refresh_interval));
-                return;
-            }
-        };
-        *next = Some(Instant::now() + self.0.cfg.refresh_interval);
-
-        let mut st = self.0.state.lock().unwrap();
-        let keys: HashMap<u64, u64> = owned.iter().map(|g| (g.game_id, g.key_id)).collect();
-        let mut changed = false;
-        for g in st.games.values_mut() {
-            let key = keys.get(&g.game_id).copied();
-            changed |= g.key_id != key;
-            g.key_id = key;
-        }
-        let mut listing_changed = false;
-        for g in owned {
-            if st.game_no(g.game_id).is_some() {
-                continue;
-            }
-            let no = st.games.keys().next_back().map_or(1, |n| n + 1);
-            if no > state::MAX_GAMES {
-                warn!("too many packs, ignoring {}", g.url);
-                continue;
-            }
-            let mut name = state::game_dir_name(&g.url, g.game_id);
-            if st.games.values().any(|x| x.name == name) {
-                name = format!("{name}-{}", g.game_id);
-            }
-            info!("new pack: {name}");
-            st.games.insert(
-                no,
-                GameState {
-                    game_id: g.game_id,
-                    name,
-                    title: g.title,
-                    key_id: Some(g.key_id),
-                    versions: Vec::new(),
-                    changed_at: now_secs(),
-                },
-            );
-            listing_changed = true;
-        }
-        if listing_changed {
-            st.changed_at = now_secs().max(st.changed_at + 1);
-        }
-        if changed || listing_changed {
-            self.save_state(&st);
-        }
-    }
-
-    /// Sync the versions of one pack with the uploads itch currently lists.
-    async fn ensure_game(&self, no: u32, force: bool) {
-        let rt = self.rt(no);
-        let mut r = rt.refresh.lock().await;
-        if !force && r.next.is_some_and(|t| Instant::now() < t) {
-            return;
-        }
-        r.next = Some(Instant::now() + self.0.cfg.refresh_interval);
-        let ids = self
-            .0
-            .state
-            .lock()
-            .unwrap()
-            .games
-            .get(&no)
-            .map(|g| (g.game_id, g.key_id, g.name.clone()));
-        let Some((game_id, Some(key_id), game_name)) = ids else {
-            return;
-        };
-        let uploads = match self.0.client.uploads(game_id, key_id).await {
-            Ok(u) => u,
-            Err(e) => {
-                warn!("could not list uploads of {game_name}, serving known versions: {e:#}");
-                r.next = Some(Instant::now() + ERROR_BACKOFF.min(self.0.cfg.refresh_interval));
-                return;
-            }
-        };
-        r.current = Some(
-            uploads
-                .iter()
-                .map(|u| (u.id, (u.build_id, fingerprint(u))))
-                .collect(),
-        );
-
-        let mut st = self.0.state.lock().unwrap();
-        let Some(g) = st.games.get_mut(&no) else {
-            return;
-        };
-        let mut new: Vec<VersionState> = uploads
-            .iter()
-            .filter(|u| {
-                !g.versions.iter().any(|v| {
-                    v.upload_id == u.id
-                        && v.build_id == u.build_id
-                        && v.fingerprint == fingerprint(u)
-                })
-            })
-            .map(|u| VersionState {
-                name: String::new(),
-                upload_id: u.id,
-                build_id: u.build_id,
-                fingerprint: fingerprint(u),
-                filename: u.filename.clone(),
-                size: u.size,
-                timestamp: state::parse_ts(u.updated_at.as_deref())
-                    .or(state::parse_ts(u.created_at.as_deref()))
-                    .unwrap_or_else(now_secs),
-            })
-            .collect();
-        if new.is_empty() {
-            return;
-        }
-        // Oldest first: later versions are de-duplicated against earlier ones.
-        new.sort_by_key(|v| (v.timestamp, v.upload_id));
-        for mut v in new {
-            if g.versions.len() >= state::MAX_VERSIONS {
-                warn!("{game_name} has too many versions, ignoring new uploads");
-                break;
-            }
-            let base = state::version_dir_name(v.timestamp, &v.filename, v.upload_id, v.build_id);
-            v.name = base.clone();
-            let mut n = 2;
-            while g.versions.iter().any(|x| x.name == v.name) {
-                v.name = format!("{base}-{n}");
-                n += 1;
-            }
-            info!("new version: {game_name}/{}", v.name);
-            g.versions.push(v);
-        }
-        g.changed_at = now_secs().max(g.changed_at + 1);
-        self.save_state(&st);
-    }
-
-    fn game(&self, no: u32) -> Result<GameState, nfsstat3> {
-        self.0
-            .state
-            .lock()
-            .unwrap()
-            .games
-            .get(&no)
-            .cloned()
-            .ok_or(nfsstat3::NFS3ERR_STALE)
-    }
-
-    fn version(&self, no: u32, ver: u16) -> Result<(u64, VersionState), nfsstat3> {
-        let st = self.0.state.lock().unwrap();
-        let g = st.games.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
-        let v = g
-            .versions
-            .get(ver as usize - 1)
-            .ok_or(nfsstat3::NFS3ERR_STALE)?;
-        Ok((g.game_id, v.clone()))
-    }
-
-    /// Where a version's archive lives in the disk cache: `.zip` if it is
-    /// served as a zip (as uploaded, or flattened), `.raw` if served whole.
-    fn archive_path(&self, game_id: u64, ver: u16, zip: bool) -> PathBuf {
-        self.0.cfg.archive_dir.join(format!(
-            "{game_id}-{ver}.{}",
-            if zip { "zip" } else { "raw" }
-        ))
-    }
-
-    /// Make sure the version's archive is in the disk cache, downloading and
-    /// unpacking it if needed. Returns its path and whether it is a zip.
-    async fn ensure_archive(&self, no: u32, ver: u16) -> Result<(PathBuf, bool)> {
-        let (game_id, v) = self
-            .version(no, ver)
-            .map_err(|_| anyhow!("unknown version"))?;
-        let key = Id::Version(no, ver).encode();
-        let _guard = self.0.locks.lock(key).await;
-        for zip in [true, false] {
-            let path = self.archive_path(game_id, ver, zip);
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-                return Ok((path, zip));
-            }
-        }
-        // An upload id can be re-used for new content, so only download if itch
-        // still serves exactly this version.
-        self.ensure_game(no, false).await;
-        let rt = self.rt(no);
-        let current = rt
-            .refresh
-            .lock()
-            .await
-            .current
-            .as_ref()
-            .map(|c| c.get(&v.upload_id).cloned());
-        match current {
-            None => bail!("{}: cannot download, itch.io is unreachable", v.name),
-            Some(c) if c != Some((v.build_id, v.fingerprint.clone())) => {
-                bail!(
-                    "{}: this version is no longer downloadable from itch.io and its archive is not in the disk cache",
-                    v.name
-                )
-            }
-            Some(_) => {}
-        }
-        let key_id = self
-            .0
-            .state
-            .lock()
-            .unwrap()
-            .games
-            .get(&no)
-            .and_then(|g| g.key_id);
-        let key_id = key_id
-            .ok_or_else(|| anyhow!("{}: pack is no longer in the itch.io library", v.name))?;
-
-        info!(
-            "downloading {} ({} bytes)",
-            v.name,
-            v.size.map_or("?".into(), |s| s.to_string())
-        );
-        let part = self.0.cfg.archive_dir.join(format!("{game_id}-{ver}.part"));
-        let flat = self.0.cfg.archive_dir.join(format!("{game_id}-{ver}.flat"));
-        let result = async {
-            let n = self.0.client.download(v.upload_id, key_id, &part).await?;
-            if let Some(size) = v.size
-                && v.build_id.is_none()
-                && size != n
-            {
-                bail!("{}: downloaded {n} bytes, expected {size}", v.name);
-            }
-            let limits = Limits {
-                max_unpacked_bytes: self.0.cfg.max_unpacked_bytes,
-                max_depth: MAX_ARCHIVE_DEPTH,
-            };
-            let (src, out, tmp, filename) = (
-                part.clone(),
-                flat.clone(),
-                self.0.cfg.archive_dir.join("tmp"),
-                v.filename.clone(),
-            );
-            let outcome = tokio::task::spawn_blocking(move || {
-                ingest::ingest(&src, &filename, &out, &tmp, limits)
-            })
-            .await??;
-            self.0.archives.forget(key);
-            let (from, zip) = match outcome {
-                Outcome::ZipAsIs => (&part, true),
-                Outcome::Flattened => (&flat, true),
-                Outcome::Raw => (&part, false),
-            };
-            let path = self.archive_path(game_id, ver, zip);
-            tokio::fs::rename(from, &path).await?;
-            Ok((path, zip))
-        }
-        .await;
-        // Whichever of the two was not promoted is scrap.
-        let _ = tokio::fs::remove_file(&part).await;
-        let _ = tokio::fs::remove_file(&flat).await;
-        result
-    }
-
-    async fn manifest(&self, no: u32, ver: u16) -> Result<Manifest> {
-        let (game_id, v) = self
-            .version(no, ver)
-            .map_err(|_| anyhow!("unknown version"))?;
-        let path = self
-            .0
-            .cfg
-            .state_dir
-            .join("manifests")
-            .join(format!("{game_id}-{ver}.json"));
-        if let Ok(bytes) = tokio::fs::read(&path).await {
-            match serde_json::from_slice(&bytes) {
-                Ok(m) => return Ok(m),
-                Err(e) => warn!("ignoring corrupt {}: {e}", path.display()),
-            }
-        }
-        let (archive, zip) = self.ensure_archive(no, ver).await?;
-        let manifest =
-            tokio::task::spawn_blocking(move || archive::scan(&archive, &v.filename, zip))
-                .await??;
-        state::write_atomic(&path, &serde_json::to_vec(&manifest)?)?;
-        Ok(manifest)
+    /// (pack directory name, version) for a pack and version number.
+    fn version(&self, no: u32, ver: u16) -> Result<(String, Arc<VersionMeta>), nfsstat3> {
+        let t = self.0.tables.read().unwrap();
+        let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
+        let v = p.versions.get(&ver).ok_or(nfsstat3::NFS3ERR_STALE)?;
+        Ok((p.meta.name.clone(), v.clone()))
     }
 
     /// The (de-duplicated) tree of a version. Loads all earlier versions first.
     async fn tree(&self, no: u32, ver: u16) -> Result<Arc<Tree>, nfsstat3> {
         let rt = self.rt(no);
-        if let Some(t) = rt.trees.read().unwrap().get(ver as usize - 1) {
+        if let Some(t) = rt.trees.read().unwrap().get(&ver) {
             return Ok(t.clone());
         }
         let mut seen = rt.load.lock().await;
-        loop {
-            let have = rt.trees.read().unwrap().len();
-            if have >= ver as usize {
-                return Ok(rt.trees.read().unwrap()[ver as usize - 1].clone());
-            }
-            let next = have as u16 + 1;
-            let (_, v) = self.version(no, next)?;
-            let manifest = self.manifest(no, next).await.map_err(io_err)?;
+        // Every version up to this one that has no tree yet, oldest first.
+        let (pack, todo): (String, Vec<Arc<VersionMeta>>) = {
+            let t = self.0.tables.read().unwrap();
+            let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
+            let have = rt.trees.read().unwrap();
+            (
+                p.meta.name.clone(),
+                p.versions
+                    .range(..=ver)
+                    .filter(|(n, _)| !have.contains_key(n))
+                    .map(|(_, v)| v.clone())
+                    .collect(),
+            )
+        };
+        for v in todo {
+            let (store, name, meta) = (self.0.store.clone(), pack.clone(), v.clone());
+            let manifest = tokio::task::spawn_blocking(move || store.manifest(&name, &meta))
+                .await
+                .map_err(|e| io_err(e.into()))?
+                .map_err(io_err)?;
             let tree = Tree::build(&manifest, &v.name, &mut seen).map_err(io_err)?;
-            rt.trees.write().unwrap().push(Arc::new(tree));
+            rt.trees.write().unwrap().insert(v.no, Arc::new(tree));
         }
+        rt.trees
+            .read()
+            .unwrap()
+            .get(&ver)
+            .cloned()
+            .ok_or(nfsstat3::NFS3ERR_STALE)
     }
 
-    async fn zip_archive(&self, no: u32, ver: u16) -> Result<PathBuf> {
-        match self.ensure_archive(no, ver).await? {
-            (path, true) => Ok(path),
-            (path, false) => bail!(
-                "{} could not be unpacked the way it was when it was first listed",
-                path.display()
+    /// The local copy of the file a version is served from, fetched from the
+    /// archive (once) if need be.
+    async fn served(&self, no: u32, ver: u16) -> Result<(Cached, Kind)> {
+        let (pack, v) = self
+            .version(no, ver)
+            .map_err(|_| anyhow!("unknown version"))?;
+        let file = v
+            .file(&v.serve)
+            .ok_or_else(|| anyhow!("{pack}/{} does not list {}", v.name, v.serve))?;
+        let src = self.0.store.file_path(&pack, &v.name, file);
+        let cached = self.0.disk.get(&src, file.size, &file.sha256).await?;
+        Ok((cached, v.kind))
+    }
+
+    async fn zip_archive(&self, no: u32, ver: u16) -> Result<Cached> {
+        match self.served(no, ver).await? {
+            (cached, Kind::Zip) => Ok(cached),
+            (cached, Kind::Raw) => bail!(
+                "{} is listed as a zip but archived as a plain file",
+                cached.path().display()
             ),
         }
     }
@@ -568,13 +387,13 @@ impl ItchFs {
         if let Some(b) = self.0.mem.get(&id) {
             return Ok(b);
         }
-        let path = self.zip_archive(no, ver).await?;
+        let zip = self.zip_archive(no, ver).await?;
         let archives = self.0.archives.clone();
         let key = Id::Version(no, ver).encode();
         let data = tokio::task::spawn_blocking(move || {
             let mut buf = Vec::with_capacity(size as usize);
             archives
-                .extract(key, &path, index, size, crc, &mut buf)
+                .extract(key, zip.path(), index, size, crc, &mut buf)
                 .map(|_| buf)
         })
         .await??;
@@ -596,21 +415,21 @@ impl ItchFs {
         let dest = self
             .0
             .cfg
-            .archive_dir
+            .cache_dir
             .join("spill")
             .join(format!("{id:016x}"));
         let _guard = self.0.locks.lock(id).await;
         if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
             return Ok(dest);
         }
-        let path = self.zip_archive(no, ver).await?;
+        let zip = self.zip_archive(no, ver).await?;
         let archives = self.0.archives.clone();
         let key = Id::Version(no, ver).encode();
         let out = dest.clone();
         tokio::task::spawn_blocking(move || {
             let part = out.with_extension("part");
             let mut file = std::io::BufWriter::new(std::fs::File::create(&part)?);
-            archives.extract(key, &path, index, size, crc, &mut file)?;
+            archives.extract(key, zip.path(), index, size, crc, &mut file)?;
             file.into_inner().map_err(|e| e.into_error())?;
             std::fs::rename(&part, &out)?;
             anyhow::Ok(())
@@ -619,35 +438,30 @@ impl ItchFs {
         Ok(dest)
     }
 
-    /// (name, id, attributes) of everything in a directory, in a stable order.
+    /// (name, attributes) of everything in a directory, in a stable order.
     async fn list(&self, dir: Id) -> Result<Vec<(String, fattr3)>, nfsstat3> {
         match dir {
             Id::Root => {
-                self.ensure_library(false).await;
-                let st = self.0.state.lock().unwrap();
-                Ok(st
-                    .games
+                let t = self.0.tables.read().unwrap();
+                Ok(t.packs
                     .iter()
-                    .filter(|(_, g)| g.key_id.is_some() || !g.versions.is_empty())
-                    .map(|(no, g)| {
+                    .map(|(no, p)| {
                         (
-                            g.name.clone(),
-                            attr(Id::Game(*no).encode(), true, 0, g.changed_at),
+                            p.meta.name.clone(),
+                            attr(Id::Game(*no).encode(), true, 0, p.changed_at),
                         )
                     })
                     .collect())
             }
             Id::Game(no) => {
-                self.game(no)?;
-                self.ensure_game(no, false).await;
-                let g = self.game(no)?;
-                Ok(g.versions
+                let t = self.0.tables.read().unwrap();
+                let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
+                Ok(p.versions
                     .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
+                    .map(|(ver, v)| {
                         (
                             v.name.clone(),
-                            attr(Id::Version(no, i as u16 + 1).encode(), true, 0, v.timestamp),
+                            attr(Id::Version(no, *ver).encode(), true, 0, v.timestamp),
                         )
                     })
                     .collect())
@@ -728,21 +542,19 @@ impl NFSFileSystem for ItchFs {
         }
         let found = match dir {
             Id::Root => {
-                self.ensure_library(false).await;
-                let st = self.0.state.lock().unwrap();
-                st.games
+                let t = self.0.tables.read().unwrap();
+                t.packs
                     .iter()
-                    .find(|(_, g)| g.name == name && (g.key_id.is_some() || !g.versions.is_empty()))
+                    .find(|(_, p)| p.meta.name == name)
                     .map(|(no, _)| Id::Game(*no))
             }
             Id::Game(no) => {
-                self.game(no)?;
-                self.ensure_game(no, false).await;
-                self.game(no)?
-                    .versions
+                let t = self.0.tables.read().unwrap();
+                let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
+                p.versions
                     .iter()
-                    .position(|v| v.name == name)
-                    .map(|i| Id::Version(no, i as u16 + 1))
+                    .find(|(_, v)| v.name == name)
+                    .map(|(ver, _)| Id::Version(no, *ver))
             }
             Id::Version(g, v) | Id::Node(g, v, _) => {
                 let n = if let Id::Node(_, _, n) = dir { n } else { 0 };
@@ -759,8 +571,12 @@ impl NFSFileSystem for ItchFs {
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         match Id::decode(id)? {
-            Id::Root => Ok(attr(id, true, 0, self.0.state.lock().unwrap().changed_at)),
-            Id::Game(no) => Ok(attr(id, true, 0, self.game(no)?.changed_at)),
+            Id::Root => Ok(attr(id, true, 0, self.0.tables.read().unwrap().changed_at)),
+            Id::Game(no) => {
+                let t = self.0.tables.read().unwrap();
+                let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
+                Ok(attr(id, true, 0, p.changed_at))
+            }
             Id::Version(no, ver) => Ok(attr(id, true, 0, self.version(no, ver)?.1.timestamp)),
             Id::Node(no, ver, n) => {
                 let (_, v) = self.version(no, ver)?;
@@ -796,6 +612,10 @@ impl NFSFileSystem for ItchFs {
             let end = (offset.saturating_add(count as u64)).min(b.len() as u64) as usize;
             b[start..end].to_vec()
         };
+        let ranged = |r: Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>| {
+            r.map_err(|e| io_err(e.into()))?
+                .map_err(|e| io_err(e.into()))
+        };
         let data = match source {
             Source::Inline(b) => slice(b),
             Source::Zip(index) if size <= self.0.mem.max_bytes() => slice(
@@ -804,16 +624,25 @@ impl NFSFileSystem for ItchFs {
                     .await
                     .map_err(io_err)?,
             ),
-            source => {
-                let path = match source {
-                    Source::Zip(index) => self.spill(id, no, ver, *index, size, crc).await,
-                    _ => self.ensure_archive(no, ver).await.map(|(path, _)| path),
-                }
-                .map_err(io_err)?;
-                tokio::task::spawn_blocking(move || archive::read_range(&path, offset, count))
+            Source::Zip(index) => {
+                let path = self
+                    .spill(id, no, ver, *index, size, crc)
                     .await
-                    .map_err(|e| io_err(e.into()))?
-                    .map_err(|e| io_err(e.into()))?
+                    .map_err(io_err)?;
+                ranged(
+                    tokio::task::spawn_blocking(move || archive::read_range(&path, offset, count))
+                        .await,
+                )?
+            }
+            Source::Raw => {
+                // The upload itself, read from its local copy.
+                let (file, _) = self.served(no, ver).await.map_err(io_err)?;
+                ranged(
+                    tokio::task::spawn_blocking(move || {
+                        archive::read_range(file.path(), offset, count)
+                    })
+                    .await,
+                )?
             }
         };
         let eof = offset.saturating_add(data.len() as u64) >= size;

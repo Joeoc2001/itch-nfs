@@ -2,7 +2,7 @@
 //! fixtures in every supported format, and a mock of the itch.io API.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -121,7 +121,29 @@ pub const TOKEN: &str = "test-token";
 pub const GAME: u64 = 500;
 pub const KEY: u64 = 77;
 
+pub struct MockGame {
+    pub id: u64,
+    pub key: u64,
+    pub title: String,
+    pub url: String,
+    /// `None`: the API does not say.
+    pub classification: Option<String>,
+}
+
+impl MockGame {
+    pub fn new(id: u64, title: &str, url: &str, classification: Option<&str>) -> Self {
+        Self {
+            id,
+            key: id + 1000,
+            title: title.into(),
+            url: url.into(),
+            classification: classification.map(str::to_string),
+        }
+    }
+}
+
 pub struct MockUpload {
+    pub game: u64,
     pub filename: String,
     pub updated_at: String,
     pub data: Vec<u8>,
@@ -130,32 +152,87 @@ pub struct MockUpload {
 impl MockUpload {
     pub fn new(filename: &str, date: &str, data: Vec<u8>) -> Self {
         Self {
+            game: GAME,
             filename: filename.into(),
             updated_at: format!("{date}T10:00:00.000000000Z"),
             data,
         }
     }
+
+    pub fn of_game(mut self, game: u64) -> Self {
+        self.game = game;
+        self
+    }
 }
 
-/// One account owning one pack ("Tiny Pack" by "creator").
-#[derive(Default)]
+/// What the mock reports as an upload's `md5_hash` (not a real MD5).
+pub fn mock_md5(data: &[u8]) -> String {
+    format!("md5-{}-{}", data.len(), crc32fast::hash(data))
+}
+
+/// An account that, to begin with, owns one pack ("Tiny Pack" by "creator").
 pub struct Mock {
+    pub games: Mutex<Vec<MockGame>>,
+    /// By upload id.
     pub uploads: Mutex<BTreeMap<u64, MockUpload>>,
+    /// Downloads served (or attempted).
     pub downloads: AtomicUsize,
+    /// Every request, of any kind.
+    pub requests: AtomicUsize,
+    /// Upload ids whose download fails with a server error.
+    pub broken: Mutex<BTreeSet<u64>>,
+    /// Replace an upload just as it is being downloaded: the download gets
+    /// the old bytes, and every listing after it describes the new upload.
+    pub swap_on_download: Mutex<BTreeMap<u64, MockUpload>>,
+}
+
+impl Default for Mock {
+    fn default() -> Self {
+        Self {
+            games: Mutex::new(vec![MockGame {
+                id: GAME,
+                key: KEY,
+                title: "Tiny Pack".into(),
+                url: "https://creator.itch.io/tiny-pack".into(),
+                classification: None,
+            }]),
+            uploads: Default::default(),
+            downloads: Default::default(),
+            requests: Default::default(),
+            broken: Default::default(),
+            swap_on_download: Default::default(),
+        }
+    }
 }
 
 type Params = Query<BTreeMap<String, String>>;
 type Json = (StatusCode, axum::Json<serde_json::Value>);
 
-fn authorised(headers: &HeaderMap, params: &BTreeMap<String, String>) -> bool {
+/// The token must be right, and a download key (if given) must be `game`'s
+/// (or, with no `game`, anyone's).
+fn authorised(
+    mock: &Mock,
+    headers: &HeaderMap,
+    params: &BTreeMap<String, String>,
+    game: Option<u64>,
+) -> bool {
+    mock.requests.fetch_add(1, Ordering::SeqCst);
     headers.get("authorization").is_some_and(|v| v == TOKEN)
-        && params
-            .get("download_key_id")
-            .is_none_or(|k| *k == KEY.to_string())
+        && params.get("download_key_id").is_none_or(|k| {
+            mock.games
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|g| *k == g.key.to_string() && game.is_none_or(|id| id == g.id))
+        })
 }
 
-async fn owned_keys(headers: HeaderMap, Query(params): Params) -> Json {
-    if !authorised(&headers, &params) {
+async fn owned_keys(
+    State(mock): State<Arc<Mock>>,
+    headers: HeaderMap,
+    Query(params): Params,
+) -> Json {
+    if !authorised(&mock, &headers, &params, None) {
         return (
             StatusCode::UNAUTHORIZED,
             axum::Json(json!({"errors": ["invalid key"]})),
@@ -163,9 +240,19 @@ async fn owned_keys(headers: HeaderMap, Query(params): Params) -> Json {
     }
     // Like the real API, an empty list is serialised as `{}`.
     let keys = match params.get("page").map(String::as_str) {
-        Some("1") => {
-            json!([{"id": KEY, "game_id": GAME, "game": {"id": GAME, "title": "Tiny Pack", "url": "https://creator.itch.io/tiny-pack"}}])
-        }
+        Some("1") => mock
+            .games
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                let mut game = json!({"id": g.id, "title": g.title, "url": g.url});
+                if let Some(c) = &g.classification {
+                    game["classification"] = json!(c);
+                }
+                json!({"id": g.key, "game_id": g.id, "game": game})
+            })
+            .collect(),
         _ => json!({}),
     };
     (
@@ -180,7 +267,8 @@ async fn uploads(
     UrlPath(game): UrlPath<u64>,
     Query(params): Params,
 ) -> Json {
-    if !authorised(&headers, &params) || game != GAME || !params.contains_key("download_key_id") {
+    if !authorised(&mock, &headers, &params, Some(game)) || !params.contains_key("download_key_id")
+    {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({"errors": ["invalid game"]})),
@@ -191,9 +279,9 @@ async fn uploads(
         .lock()
         .unwrap()
         .iter()
+        .filter(|(_, u)| u.game == game)
         .map(|(id, u)| {
-            let md5 = format!("md5-{}-{}", u.data.len(), crc32fast::hash(&u.data));
-            json!({"id": id, "filename": u.filename, "size": u.data.len(), "md5_hash": md5, "storage": "hosted", "created_at": u.updated_at, "updated_at": u.updated_at})
+            json!({"id": id, "filename": u.filename, "size": u.data.len(), "md5_hash": mock_md5(&u.data), "storage": "hosted", "created_at": u.updated_at, "updated_at": u.updated_at})
         })
         .collect();
     (StatusCode::OK, axum::Json(json!({"uploads": list})))
@@ -205,16 +293,23 @@ async fn download(
     UrlPath(id): UrlPath<u64>,
     Query(params): Params,
 ) -> Result<Vec<u8>, StatusCode> {
-    if !authorised(&headers, &params) || !params.contains_key("download_key_id") {
+    let game = mock.uploads.lock().unwrap().get(&id).map(|u| u.game);
+    if !authorised(&mock, &headers, &params, game) || !params.contains_key("download_key_id") {
         return Err(StatusCode::FORBIDDEN);
     }
     mock.downloads.fetch_add(1, Ordering::SeqCst);
-    mock.uploads
-        .lock()
-        .unwrap()
+    if mock.broken.lock().unwrap().contains(&id) {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let mut uploads = mock.uploads.lock().unwrap();
+    let data = uploads
         .get(&id)
         .map(|u| u.data.clone())
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if let Some(replacement) = mock.swap_on_download.lock().unwrap().remove(&id) {
+        uploads.insert(id, replacement);
+    }
+    Ok(data)
 }
 
 pub fn router(mock: Arc<Mock>) -> Router {
@@ -227,10 +322,19 @@ pub fn router(mock: Arc<Mock>) -> Router {
 
 /// Serve the mock on an ephemeral local port.
 pub async fn spawn(mock: Arc<Mock>) -> std::net::SocketAddr {
+    spawn_stoppable(mock).await.0
+}
+
+/// As [`spawn`], also returning the server task: abort it to take the API down.
+pub async fn spawn_stoppable(
+    mock: Arc<Mock>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = http.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(http, router(mock)).await });
-    addr
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(http, router(mock)).await;
+    });
+    (addr, task)
 }
 
 /// A pack history that exercises every format, nesting and de-duplication.
@@ -273,4 +377,71 @@ pub fn fixture_uploads() -> BTreeMap<u64, MockUpload> {
             ),
         ),
     ])
+}
+
+/// A scanner configuration for tests: everything in scope, no pacing.
+pub fn scan_config(
+    archive: &std::path::Path,
+    cache: &std::path::Path,
+) -> itch_nfs::scan::ScanConfig {
+    itch_nfs::scan::ScanConfig {
+        archive_dir: archive.to_path_buf(),
+        cache_dir: cache.to_path_buf(),
+        max_unpacked_bytes: 1 << 30,
+        only: Vec::new(),
+        classifications: Vec::new(),
+        concurrency: 2,
+    }
+}
+
+pub fn client(mock_addr: std::net::SocketAddr) -> itch_nfs::itch::ItchClient {
+    itch_nfs::itch::ItchClient::new(&format!("http://{mock_addr}"), TOKEN.into()).unwrap()
+}
+
+pub fn scanner(
+    mock_addr: std::net::SocketAddr,
+    cfg: itch_nfs::scan::ScanConfig,
+) -> itch_nfs::scan::Scanner {
+    itch_nfs::scan::Scanner::new(cfg, client(mock_addr)).unwrap()
+}
+
+/// What identifies a file on disk, and when it was last written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    pub inode: u64,
+    pub size: u64,
+    pub mtime: (i64, i64),
+}
+
+/// Every file under `dir`, by `/`-separated relative path.
+pub fn snapshot(dir: &std::path::Path) -> BTreeMap<String, Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut BTreeMap<String, Stamp>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries {
+            let path = e.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                walk(&path, root, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string(),
+                    Stamp {
+                        inode: meta.ino(),
+                        size: meta.size(),
+                        mtime: (meta.mtime(), meta.mtime_nsec()),
+                    },
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
 }

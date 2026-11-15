@@ -1,6 +1,7 @@
 //! Minimal client for the parts of the itch.io API we need.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
@@ -10,10 +11,17 @@ use tokio::io::AsyncWriteExt;
 
 pub const DEFAULT_API_URL: &str = "https://api.itch.io";
 
+/// How long a response may send nothing before the request fails.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct ItchClient {
     http: reqwest::Client,
     base: String,
     token: String,
+    /// Minimum time between the starts of two requests.
+    delay: Duration,
+    /// When the next request may start.
+    next: tokio::sync::Mutex<tokio::time::Instant>,
 }
 
 /// A game (asset pack) the account owns, with the download key that grants access.
@@ -23,6 +31,9 @@ pub struct OwnedGame {
     pub game_id: u64,
     pub title: String,
     pub url: String,
+    /// What kind of project itch.io says this is (`assets`, `game`, `tool`,
+    /// ...), if it says.
+    pub classification: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,12 +68,14 @@ struct OwnedKey {
     game: Option<Game>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct Game {
     #[serde(default)]
     title: String,
     #[serde(default)]
     url: String,
+    #[serde(default)]
+    classification: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -86,15 +99,44 @@ fn lenient_vec<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(
 
 impl ItchClient {
     pub fn new(base: &str, token: String) -> Result<Self> {
+        Self::with_idle_timeout(base, token, IDLE_TIMEOUT)
+    }
+
+    /// As [`ItchClient::new`], but giving up on a response that sends nothing
+    /// for `idle`.
+    pub fn with_idle_timeout(base: &str, token: String, idle: Duration) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("itch-nfs/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(20))
+            // Bounds the gap between two reads, not the whole response, so
+            // it does not limit how large (or slow) a download may be. A
+            // download has no other timeout, and one that stalled would
+            // otherwise hold its place in the scan for ever.
+            .read_timeout(idle)
             .build()?;
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_string(),
             token,
+            delay: Duration::ZERO,
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
         })
+    }
+
+    /// Space requests at least `delay` apart, however many tasks share the client.
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    /// Wait for this request's turn.
+    async fn pace(&self) {
+        if self.delay.is_zero() {
+            return;
+        }
+        let mut next = self.next.lock().await;
+        tokio::time::sleep_until(*next).await;
+        *next = tokio::time::Instant::now() + self.delay;
     }
 
     async fn get_json<T: DeserializeOwned>(
@@ -103,6 +145,7 @@ impl ItchClient {
         query: &[(&str, String)],
     ) -> Result<T> {
         let url = format!("{}{}", self.base, path);
+        self.pace().await;
         let resp = self
             .http
             .get(&url)
@@ -139,15 +182,13 @@ impl ItchClient {
                 break;
             }
             out.extend(p.owned_keys.into_iter().map(|k| {
-                let g = k.game.unwrap_or(Game {
-                    title: String::new(),
-                    url: String::new(),
-                });
+                let g = k.game.unwrap_or_default();
                 OwnedGame {
                     key_id: k.id,
                     game_id: k.game_id,
                     title: g.title,
                     url: g.url,
+                    classification: g.classification.filter(|c| !c.is_empty()),
                 }
             }));
         }
@@ -167,6 +208,7 @@ impl ItchClient {
     /// Stream an upload to `dest`, returning the number of bytes written.
     pub async fn download(&self, upload_id: u64, key_id: u64, dest: &Path) -> Result<u64> {
         let url = format!("{}/uploads/{upload_id}/download", self.base);
+        self.pace().await;
         let resp = self
             .http
             .get(&url)

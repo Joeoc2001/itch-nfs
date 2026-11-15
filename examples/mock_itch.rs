@@ -2,7 +2,7 @@
 //! the real server binary and mount it without an itch.io account.
 //!
 //!     cargo run --example mock_itch -- 127.0.0.1:8099
-//!     ITCH_TOKEN=test-token itch-nfs --api-url http://127.0.0.1:8099
+//!     ITCH_TOKEN=test-token itch-nfs scan --api-url http://127.0.0.1:8099
 
 #[path = "../tests/support/mod.rs"]
 mod support;
