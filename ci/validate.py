@@ -2,8 +2,12 @@
 """Validate a mounted itch-nfs export.
 
 Walks the mount the way a build would and checks the promises the server
-makes: packs contain pinned versions only, every file reads back in full,
-later versions never repeat a file of an earlier one, and nothing is writable.
+makes: a pack is one directory holding every version, every file reads back
+in full, every file the pack's listing points at is there, and nothing is
+writable. With --archive-dir the export is also checked against the archive's
+own listings: every file of every version is served exactly once, at its own
+path, or tagged (`name.v<version no>.ext`) if an earlier version has other
+content there, or not at all if an earlier version has the same file.
 
 By default pack names are not printed, because CI logs may be public and the
 library belongs to whoever owns the token. Pass --names to print them.
@@ -14,7 +18,9 @@ import errno
 import hashlib
 import json
 import os
+import re
 import sys
+import zlib
 
 DEDUP_FILE = ".itch-nfs-deduplicated.tsv"
 ARCHIVE_SUFFIXES = (".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz", ".tar.zst", ".tzst")
@@ -34,19 +40,109 @@ def warn(message):
 
 
 def files_under(root):
-    for base, dirs, names in os.walk(root, onerror=lambda e: fail(f"cannot list {os.path.relpath(e.filename, root)} under a version: {e.strerror}")):
+    for base, dirs, names in os.walk(root, onerror=lambda e: fail(f"cannot list {os.path.relpath(e.filename, root)}: {e.strerror}")):
         dirs.sort()
         for name in sorted(names):
             yield os.path.join(base, name)
 
 
 def digest(path):
-    h, size = hashlib.sha256(), 0
+    """(sha256, size, CRC-32) of a file, reading all of it."""
+    h, size, crc = hashlib.sha256(), 0, 0
     with open(path, "rb") as f:
         while chunk := f.read(1 << 20):
             h.update(chunk)
+            crc = zlib.crc32(chunk, crc)
             size += len(chunk)
-    return h.hexdigest(), size
+    return h.hexdigest(), size, crc
+
+
+def tagged(name, version_no):
+    """The names a file called `name` may be served under when version
+    `version_no` finds the path taken: the tag goes before the type suffix."""
+    lower = name.lower()
+    suffix = max((s for s in ARCHIVE_SUFFIXES if lower.endswith(s) and len(s) < len(name)), key=len, default=None)
+    if suffix:
+        cut = len(name) - len(suffix)
+    else:
+        dot = name.rfind(".")
+        cut = dot if dot > 0 else len(name)
+    return re.compile(re.escape(name[:cut]) + rf"\.v{version_no}(-[1-9][0-9]*)?" + re.escape(name[cut:]) + "$")
+
+
+def archived_versions(archive_dir, pack):
+    """The committed versions of a pack, in number order, each with the
+    entries of its listing: [(no, name, [(path, size, crc)])]."""
+    versions = []
+    pack_dir = os.path.join(archive_dir, "packs", pack)
+    for version in os.listdir(pack_dir):
+        try:
+            with open(os.path.join(pack_dir, version, "version.json")) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue  # pack.json, or a version that is not committed
+        with open(os.path.join(pack_dir, version, "manifest.json")) as f:
+            manifest = json.load(f)
+        versions.append((meta["no"], meta["name"], [(e["path"], e["size"], e["crc"]) for e in manifest["entries"]]))
+    return sorted(versions)
+
+
+def check_against_archive(label, versions, served, rows):
+    """Recompute, from the archive's listings alone, where every file of every
+    version must be, and compare with what the export serves.
+
+    `served`: path in the pack directory -> (size, crc) of what was read there.
+    `rows`: (version name, path in upload) -> (served path, why), the listing.
+    """
+    seen = set()  # (file name, size, crc) of every file of the earlier versions
+    taken = {}  # served path -> the version it came from
+    for no, version, entries in versions:
+        fresh, paths = set(), set()
+        for path, size, crc in entries:
+            # Within one version, a path that repeats, or that runs through
+            # a file, cannot exist: the first entry wins.
+            parts = path.split("/")
+            if path in paths or any("/".join(parts[:i]) in paths for i in range(1, len(parts))):
+                continue
+            paths.add(path)
+            key = (parts[-1], size, crc)
+            row = rows.pop((version, path), None)
+            if key in seen:
+                # Identical to a file of an earlier version: not served again.
+                if row is None or row[1] != "duplicate":
+                    fail(f"{label}: {version}: {path} repeats a file of an earlier version, but is not listed as a duplicate")
+                elif served.get(row[0]) != (size, crc):
+                    fail(f"{label}: {version}: {path} is listed as a duplicate of {row[0]}, which is not the same file")
+                elif taken.get(row[0]) in (None, version):
+                    fail(f"{label}: {version}: {path} is listed as a duplicate of {row[0]}, which no earlier version brought")
+                continue
+            fresh.add(key)
+            if row is None:
+                at = path
+            elif row[1] != "renamed":
+                fail(f"{label}: {version}: {path} is new in this version, but is listed as {row[1]}")
+                continue
+            else:
+                at = row[0]
+                # Renamed only for a reason: at each level the name is its
+                # own, or tagged with this version's number.
+                theirs, ours = at.split("/"), parts
+                if len(theirs) != len(ours) or not all(a == b or tagged(b, no).match(a) for a, b in zip(theirs, ours)) or at == path:
+                    fail(f"{label}: {version}: {path} is served as {at}, which is not that path tagged with .v{no}")
+                # ... and the plain path belongs to an earlier version.
+                clash = next(("/".join(ours[:i]) for i in range(1, len(ours) + 1) if theirs[i - 1] != ours[i - 1]), path)
+                if not any(p == clash or p.startswith(clash + "/") for p, v in taken.items() if v != version):
+                    fail(f"{label}: {version}: {path} is served as {at}, but no earlier version has taken {clash}")
+            if at in taken:
+                fail(f"{label}: {version}: {path} is served at {at}, which is also {taken[at]}'s")
+            elif served.get(at) != (size, crc):
+                fail(f"{label}: {version}: {path} should be served at {at}" + (", which is missing" if at not in served else ", which has other content"))
+            taken[at] = version
+        seen |= fresh
+    for (version, path), (at, why) in rows.items():
+        fail(f"{label}: the listing has a row for {version}: {path}, which the archive does not have")
+    for path in sorted(set(served) - set(taken)):
+        fail(f"{label}: {path} is served, but is no file of any version in the archive")
 
 
 def upload_sizes(archive_dir):
@@ -92,57 +188,66 @@ def choose_packs(args, packs):
 
 def validate_pack(args, pack, label):
     pack_dir = os.path.join(args.mount, pack)
-    versions = sorted(os.listdir(pack_dir))
-    if not versions:
-        fail(f"{label}: no versions")
-    if any(v.lower() in ("latest", "current") for v in versions):
-        fail(f"{label}: has an unpinned version directory")
-    seen = {}  # (file name, sha256) -> the version it appears in
-    stats = {"versions": len(versions), "files": 0, "bytes": 0, "hidden": 0}
-    for version in versions:
-        vdir = os.path.join(pack_dir, version)
-        fresh = {}
-        for path in files_under(vdir):
-            rel = os.path.relpath(path, pack_dir)
-            if os.path.islink(path):
-                fail(f"{label}: {rel} is a symlink")
-                continue
-            try:
-                sha, size = digest(path)
-            except OSError as e:
-                fail(f"{label}: cannot read {rel}: {e.strerror}")
-                continue
-            if size != os.stat(path).st_size:
-                fail(f"{label}: {rel} reads {size} bytes but stats as {os.stat(path).st_size}")
-            if os.path.basename(path) == DEDUP_FILE and os.path.dirname(path) == vdir:
-                continue
-            stats["files"] += 1
-            stats["bytes"] += size
-            key = (os.path.basename(path), sha)
-            if key in seen:
-                fail(f"{label}: {rel} is also in version {seen[key]}: only the earliest copy should be visible")
-            fresh.setdefault(key, version)
-            if path.lower().endswith(ARCHIVE_SUFFIXES):
-                (fail if args.strict_archives else warn)(f"{label}: {rel} is an archive that was not unpacked")
-        seen.update({k: v for k, v in fresh.items() if k not in seen})
-
-        listing = os.path.join(vdir, DEDUP_FILE)
-        if not os.path.isfile(listing):
-            fail(f"{label}: {version} has no {DEDUP_FILE}")
+    stats = {"versions": "?", "files": 0, "bytes": 0, "renamed": 0, "hidden": 0}
+    if not os.listdir(pack_dir):
+        fail(f"{label}: empty")
+    served = {}  # path in the pack directory -> (size, crc)
+    for path in files_under(pack_dir):
+        rel = os.path.relpath(path, pack_dir)
+        if os.path.islink(path):
+            fail(f"{label}: {rel} is a symlink")
             continue
+        try:
+            _, size, crc = digest(path)
+        except OSError as e:
+            fail(f"{label}: cannot read {rel}: {e.strerror}")
+            continue
+        if size != os.stat(path).st_size:
+            fail(f"{label}: {rel} reads {size} bytes but stats as {os.stat(path).st_size}")
+        if rel == DEDUP_FILE:
+            continue
+        served[rel] = (size, crc)
+        stats["files"] += 1
+        stats["bytes"] += size
+        if path.lower().endswith(ARCHIVE_SUFFIXES):
+            (fail if args.strict_archives else warn)(f"{label}: {rel} is an archive that was not unpacked")
+
+    # The pack's listing: every file not served at its own path, and where
+    # it, or the earliest copy of it, is.
+    rows = {}
+    listing = os.path.join(pack_dir, DEDUP_FILE)
+    if not os.path.isfile(listing):
+        fail(f"{label}: no {DEDUP_FILE}")
+    else:
         with open(listing, encoding="utf-8") as f:
             for line in f:
                 if line.startswith("#") or not line.strip():
                     continue
-                hidden, _, earliest = line.rstrip("\n").partition("\t")
-                stats["hidden"] += 1
-                if os.path.lexists(os.path.join(vdir, hidden)):
-                    fail(f"{label}: {version}/{hidden} is listed as hidden but exists")
-                if not os.path.isfile(os.path.join(pack_dir, earliest)):
-                    fail(f"{label}: {version}/{hidden} points at {earliest}, which does not exist")
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) != 4 or fields[3] not in ("renamed", "duplicate"):
+                    fail(f"{label}: malformed row in {DEDUP_FILE}: {line.rstrip()!r}")
+                    continue
+                version, path, at, why = fields
+                if (version, path) in rows:
+                    fail(f"{label}: {DEDUP_FILE} lists {version}: {path} twice")
+                rows[(version, path)] = (at, why)
+                stats["renamed" if why == "renamed" else "hidden"] += 1
+                if at not in served:
+                    fail(f"{label}: {version}: {path} is listed as served at {at}, which is not a file of the export")
+                if why == "renamed" and at == path:
+                    fail(f"{label}: {version}: {path} is listed as renamed to itself")
+
+    if args.archive_dir:
+        try:
+            versions = archived_versions(args.archive_dir, pack)
+        except (OSError, ValueError, KeyError) as e:
+            fail(f"{label}: cannot read the pack's listings in the archive: {e}")
+        else:
+            stats["versions"] = len(versions)
+            check_against_archive(label, versions, served, rows)
 
     try:
-        with open(os.path.join(pack_dir, versions[0] if versions else "", "itch-nfs-write-test"), "w"):
+        with open(os.path.join(pack_dir, "itch-nfs-write-test"), "w"):
             pass
         fail(f"{label}: the export is writable")
     except OSError as e:
@@ -185,7 +290,7 @@ def main():
     for i, pack in enumerate(chosen, 1):
         label = pack if args.names else f"pack #{i}"
         stats = validate_pack(args, pack, label)
-        print(f"{label}: {stats['versions']} version(s), {stats['files']} file(s), {stats['bytes']} bytes read, {stats['hidden']} de-duplicated")
+        print(f"{label}: {stats['versions']} version(s), {stats['files']} file(s), {stats['bytes']} bytes read, {stats['renamed']} renamed, {stats['hidden']} de-duplicated")
 
     if args.expect:
         with open(args.expect) as f:

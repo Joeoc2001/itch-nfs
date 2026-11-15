@@ -344,46 +344,46 @@ async fn a_migrated_deployment_keeps_its_names_and_handles() {
     );
     assert_eq!(vs[4].note, None);
 
-    // Served: the same tree as ever (ci/mock-expected.txt predates all this),
-    // under the old numbers.
+    // Served: the same tree as a deployment that was never migrated
+    // (ci/mock-expected.txt), under the old numbers.
     let (_fs, mut c) = serve(archive.path(), cache.path()).await;
     assert_eq!(ls(&mut c, "/").await, [PACK]);
     let mut migrated = BTreeMap::new();
     tree(&mut c, PACK, &mut migrated).await;
-    let listing: String = migrated.keys().map(|p| format!("{p}\n")).collect();
     let expected =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ci/mock-expected.txt"))
             .unwrap();
-    assert_eq!(listing, expected);
+    let mut expected: Vec<&str> = expected.lines().collect();
+    expected.sort();
+    assert_eq!(migrated.keys().collect::<Vec<_>>(), expected);
     assert_eq!(
         walk(&mut c, PACK).await.unwrap().data.0,
         handle(PACK_NO, 0, 0)
     );
-    for (i, name) in NAMES.iter().enumerate() {
+    // Version names are not exported; each file has the number of the
+    // version that brought it in its handle.
+    for name in NAMES {
         assert_eq!(
-            walk(&mut c, &format!("{PACK}/{name}"))
-                .await
-                .unwrap()
-                .data
-                .0,
-            handle(PACK_NO, i as u16 + 1, 0)
+            walk(&mut c, &format!("{PACK}/{name}")).await.unwrap_err(),
+            nfsstat3::NFS3ERR_NOENT
         );
     }
-    assert_eq!(
-        cat(
-            &mut c,
-            &format!(
-                "{PACK}/{}/tiny/extras.tar.gz/more/deeper.zip/deep.txt",
-                NAMES[0]
-            )
-        )
-        .await,
-        b"deep\n"
-    );
-    assert_eq!(
-        cat(&mut c, &format!("{PACK}/{}/Tiny Manual.pdf", NAMES[4])).await,
-        b"%PDF-1.4 not really"
-    );
+    for (path, version, data) in [
+        (
+            "tiny/extras.tar.gz/more/deeper.zip/deep.txt",
+            1,
+            &b"deep\n"[..],
+        ),
+        ("tiny-v2/b.png", 2, b"BBBB"),
+        ("tiny/b.v3.png", 3, b"bbb3"),
+        ("tiny/extras.tar.gz/x.v4.txt", 4, b"x4\n"),
+        ("Tiny Manual.pdf", 5, b"%PDF-1.4 not really"),
+    ] {
+        let path = format!("{PACK}/{path}");
+        assert_eq!(cat(&mut c, &path).await, data, "{path}");
+        let id = u64::from_be_bytes(migrated[&path].as_slice().try_into().unwrap());
+        assert_eq!((id >> 28) & 0xFFFF, version, "{path}");
+    }
 
     // File handles: the same as a deployment that was never migrated has for
     // the same uploads, but for the pack number (the top 20 bits), which is
@@ -510,33 +510,49 @@ async fn versions_that_were_never_downloaded_are_fetched_or_left_as_gaps() {
         Some("upload/Tiny Manual.pdf")
     );
 
-    // The frontend serves around the gap, with the old handles.
+    // The frontend serves around the gap, with the old numbers: a file's
+    // handle and the tag of a clashing name carry the version's own number.
     let (_fs, mut c) = serve(archive.path(), cache.path()).await;
-    assert_eq!(ls(&mut c, PACK).await, [NAMES[0], NAMES[3], NAMES[4]]);
-    for (no, name) in numbered {
-        assert_eq!(
-            walk(&mut c, &format!("{PACK}/{name}"))
-                .await
-                .unwrap()
-                .data
-                .0,
-            handle(PACK_NO, no, 0)
-        );
-    }
     assert_eq!(
-        cat(&mut c, &format!("{PACK}/{}/fonts.tar.zst/f.ttf", NAMES[3])).await,
+        ls(&mut c, PACK).await,
+        [
+            ".itch-nfs-deduplicated.tsv",
+            "Tiny Manual.pdf",
+            "b.png",
+            "fonts.tar.zst",
+            "plain.tar",
+            "tiny"
+        ]
+    );
+    assert_eq!(
+        cat(&mut c, &format!("{PACK}/fonts.tar.zst/f.ttf")).await,
         b"font"
     );
     assert_eq!(
-        cat(&mut c, &format!("{PACK}/{}/Tiny Manual.pdf", NAMES[4])).await,
+        cat(&mut c, &format!("{PACK}/Tiny Manual.pdf")).await,
         b"%PDF-1.4 not really"
     );
     // b.png of version 4 duplicates version 2's, which is a gap: with no
     // earlier copy to point at, it is visible rather than lost.
+    assert_eq!(cat(&mut c, &format!("{PACK}/b.png")).await, b"BBBB");
     assert_eq!(
-        cat(&mut c, &format!("{PACK}/{}/b.png", NAMES[3])).await,
-        b"BBBB"
+        cat(&mut c, &format!("{PACK}/tiny/extras.tar.gz/x.v4.txt")).await,
+        b"x4\n"
     );
+    for (path, no) in [
+        ("tiny/a.png", 1),
+        ("b.png", 4),
+        ("tiny/extras.tar.gz/x.v4.txt", 4),
+        ("Tiny Manual.pdf", 5),
+    ] {
+        let fh = walk(&mut c, &format!("{PACK}/{path}")).await.unwrap();
+        let id = u64::from_be_bytes(fh.data.0[..].try_into().unwrap());
+        assert_eq!(
+            (id >> 44, (id >> 28) & 0xFFFF),
+            (PACK_NO as u64, no),
+            "{path}"
+        );
+    }
 
     // Migrating again fetches nothing more and breaks nothing.
     let stamp = snapshot(archive.path());
@@ -632,8 +648,5 @@ async fn a_plain_zip_is_imported_as_the_original_upload() {
         ]
     );
     let (_fs, mut c) = serve(archive.path(), cache.path()).await;
-    assert_eq!(
-        cat(&mut c, &format!("{PACK}/2024-01-05-plain-u1/b.png")).await,
-        b"bbbb"
-    );
+    assert_eq!(cat(&mut c, &format!("{PACK}/b.png")).await, b"bbbb");
 }

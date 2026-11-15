@@ -337,7 +337,8 @@ pub async fn spawn_stoppable(
     (addr, task)
 }
 
-/// A pack history that exercises every format, nesting and de-duplication.
+/// A pack history that exercises every format, nesting, de-duplication, and
+/// versions that put other content at a path an earlier version has taken.
 /// `ci/mock-expected.txt` is the tree the server must produce from it.
 pub fn fixture_uploads() -> BTreeMap<u64, MockUpload> {
     let deep = zip_of(&[("deep.txt", b"deep\n")]);
@@ -357,11 +358,23 @@ pub fn fixture_uploads() -> BTreeMap<u64, MockUpload> {
         ("tiny-v2/extras.tar.gz", &extras),
         ("tiny-v2/sounds.tar.xz", &sounds),
     ]);
-    let v3 = rar_of(&[("docs/readme.txt", b"read me\n"), ("docs/a.png", b"aaaa")]);
+    let v3 = rar_of(&[
+        ("docs/readme.txt", b"read me\n"),
+        ("docs/a.png", b"aaaa"),
+        // Version 1 has other content at this path.
+        ("tiny/b.png", b"bbb3"),
+    ]);
     let v4 = tar_bz2_of(&[
         ("b.png", b"BBBB"),
         ("fonts.tar.zst", &tar_zst_of(&[("f.ttf", b"font")])),
         ("plain.tar", &tar_of(&[("p.txt", b"plain\n")])),
+        // In version 1 this could not be opened, so there it is a file.
+        ("tiny/broken.zip", &zip_of(&[("fixed.txt", b"fixed\n")])),
+        // Shares version 1's directory: x.txt changed, y.txt is new.
+        (
+            "tiny/extras.tar.gz",
+            &tar_gz_of(&[("x.txt", b"x4\n"), ("y.txt", b"y\n")]),
+        ),
     ]);
     BTreeMap::from([
         (1, MockUpload::new("Tiny Pack v1.zip", "2024-01-05", v1)),

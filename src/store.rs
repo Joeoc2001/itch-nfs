@@ -70,7 +70,8 @@ pub struct FileMeta {
 pub struct VersionMeta {
     /// Version number within the pack, from 1. Bits 28..44 of NFS file ids.
     pub no: u16,
-    /// Directory name, under the pack directory in the archive and the export.
+    /// Directory name, under the pack directory in the archive. The export
+    /// only names it in a pack's `.itch-nfs-deduplicated.tsv`.
     pub name: String,
     pub upload_id: u64,
     pub build_id: Option<u64>,
