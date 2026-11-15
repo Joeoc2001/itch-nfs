@@ -1,7 +1,7 @@
 # itch-nfs
 A vibecoded virtual NFS to self-host itch.io asset packs
 
-Lets you supply an oauth token for your account and then 'browse' decompressed versions of the asset packs you own.
+Give it an itch.io API key and it archives every asset pack you own, then lets you browse decompressed versions of them over NFS, without the server needing the key or itch.io at all.
 
 I had claude build this because I was fed up with self-hosting git lfs and also keeping my asset packs up to date.
 
@@ -22,7 +22,8 @@ for example
 ```
 
 * **Every version is its own directory, and there is no `latest`.** A version is one
-  upload on the pack's itch.io page, named `<upload date>-<file name>-u<upload id>`.
+  upload on the pack's itch.io page, named `<upload date>-<file name>-u<upload id>`
+  (plus `-b<build id>` for an upload pushed with butler).
   Names are assigned once and never change, so a path you pin keeps working.
 * **Later versions only contain what is new.** A file that is identical (same file
   name, size and CRC-32, regardless of folder) to one in an earlier version of the
@@ -30,7 +31,8 @@ for example
   version has a `.itch-nfs-deduplicated.tsv` at its top listing what was hidden
   and where the earliest copy is.
 * **Archives are unpacked, recursively.** Uploads in zip, 7z, rar, tar, tar.gz,
-  tar.bz2, tar.xz or tar.zst form are exposed as their contents. An archive
+  tar.bz2, tar.xz or tar.zst form (and the short spellings: `.tgz`, `.tbz2`,
+  `.tbz`, `.txz`, `.tzst`) are exposed as their contents. An archive
   *inside* an upload becomes a directory named after it, up to 8 levels deep:
   `Pack.zip` containing `sfx.tar.gz` shows up as `<version>/sfx.tar.gz/boom.ogg`.
 * Only files with an archive extension are opened, so archives in disguise
@@ -195,9 +197,10 @@ Both programs:
 | `--token` | `ITCH_TOKEN` | | itch.io token |
 | `--token-file` | `ITCH_TOKEN_FILE` | | file containing the token |
 | `--interval` | `ITCH_NFS_SCAN_INTERVAL` | | keep running, with this many seconds between scans. Without it: scan once and exit, non-zero if anything failed |
-| `--only` | `ITCH_NFS_ONLY` | | only scan this pack directory name (repeatable) |
+| `--api-url` | `ITCH_NFS_API_URL` | `https://api.itch.io` | itch.io API base URL (the tests point it at a mock) |
+| `--only` | `ITCH_NFS_ONLY` | | only scan this pack directory name (repeatable; comma-separated in the environment) |
 | `--list` | | | print what would be archived, download nothing |
-| `--classification` | `ITCH_NFS_CLASSIFICATION` | `assets` | itch.io classifications to archive (repeatable), or `any` |
+| `--classification` | `ITCH_NFS_CLASSIFICATION` | `assets` | itch.io classifications to archive (repeatable; comma-separated in the environment), or `any` |
 | `--max-unpacked-gb` | `ITCH_NFS_MAX_UNPACKED_GB` | `100` | do not unpack uploads that decompress to more than this (archive bombs) |
 | `--concurrency` | `ITCH_NFS_CONCURRENCY` | `2` | packs scanned and downloaded at once |
 | `--api-delay-ms` | `ITCH_NFS_API_DELAY_MS` | `250` | minimum time between two requests to itch.io |
@@ -251,6 +254,10 @@ docker run --rm -e ITCH_TOKEN=... \
   -v itch-nfs-data:/old/data:ro -v itch-nfs-cache:/old/cache:ro -v <archive volume>:/archive \
   ghcr.io/joeoc2001/itch-nfs migrate --state-dir /old/data --old-archive-dir /old/cache
 ```
+
+`migrate` also takes `--cache-dir`, `--max-unpacked-gb` and the token and
+API flags of `scan`; `--state-dir` and `--old-archive-dir` can be given as
+`ITCH_NFS_STATE_DIR` and `ITCH_NFS_OLD_ARCHIVE_DIR`.
 
 Every pack and version keeps its name and number, so pinned paths and NFS
 file handles stay valid. The old directories are only read; delete them once
