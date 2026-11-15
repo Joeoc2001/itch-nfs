@@ -1,5 +1,6 @@
-//! The frontend's virtual filesystem: `/<pack>/<version>/<archive contents>`,
-//! served from the archive directory.
+//! The frontend's virtual filesystem: `/<pack>/<contents of every version,
+//! merged>`, served from the archive directory. How the versions of a pack
+//! are merged into one directory is in [`crate::tree`].
 //!
 //! Nothing here talks to itch.io, and nothing here writes to the archive.
 
@@ -19,7 +20,7 @@ use crate::archive::{self, Archives, Kind};
 use crate::cache::{KeyedLocks, MemCache};
 use crate::diskcache::{Cached, DiskCache};
 use crate::store::{Pack, PackMeta, Store, VersionMeta};
-use crate::tree::{NodeKind, Seen, Source, Tree};
+use crate::tree::{self, Node, NodeId, NodeKind, PackTree, Source};
 
 pub struct Config {
     /// The durable archive the scanner writes. Only ever read here.
@@ -45,12 +46,17 @@ const MAX_READ: u32 = 1024 * 1024;
 /// The numbers are recorded in the archive (`pack.json`, `version.json`), so
 /// the ids (and the NFS file handles made from them) stay valid across
 /// restarts, and across the loss of everything but the archive.
+///
+/// A file or directory inside a pack carries the number of the version that
+/// brought it and its node number in that version's own tree. Version 0 is
+/// the pack itself: node 0 is the pack directory and node 1 its
+/// `.itch-nfs-deduplicated.tsv`. Node 0 of a version was the version's own
+/// directory when the export had one per version; those ids are stale now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Id {
     Root,
     Game(u32),
-    Version(u32, u16),
-    Node(u32, u16, u32),
+    Node(u32, NodeId),
 }
 
 const ROOT_ID: u64 = 1;
@@ -60,8 +66,7 @@ impl Id {
         match self {
             Id::Root => ROOT_ID,
             Id::Game(g) => (g as u64) << 44,
-            Id::Version(g, v) => (g as u64) << 44 | (v as u64) << 28,
-            Id::Node(g, v, n) => (g as u64) << 44 | (v as u64) << 28 | n as u64,
+            Id::Node(g, n) => zip_key(g, n.ver) | n.node as u64,
         }
     }
 
@@ -74,21 +79,41 @@ impl Id {
             (id >> 28) as u16,
             (id & 0xFFF_FFFF) as u32,
         );
+        let node = NodeId { ver: v, node: n };
         match (g, v, n) {
-            (0, _, _) | (_, 0, 1..) => Err(nfsstat3::NFS3ERR_STALE),
+            (0, _, _) => Err(nfsstat3::NFS3ERR_STALE),
             (g, 0, 0) => Ok(Id::Game(g)),
-            (g, v, 0) => Ok(Id::Version(g, v)),
-            (g, v, n) => Ok(Id::Node(g, v, n)),
+            (g, 0, _) if node == tree::LISTING => Ok(Id::Node(g, node)),
+            // The rest of version 0 is unused, and node 0 of a version is a
+            // version directory of the old layout.
+            (_, 0, _) | (_, _, 0) => Err(nfsstat3::NFS3ERR_STALE),
+            (g, _, _) => Ok(Id::Node(g, node)),
         }
     }
+
+    /// The id of a node of a pack's tree.
+    fn of(pack: u32, node: NodeId) -> Id {
+        if node == tree::ROOT {
+            Id::Game(pack)
+        } else {
+            Id::Node(pack, node)
+        }
+    }
+}
+
+/// What the pool of open zips knows a version's zip by: the id its directory
+/// had when every version had one.
+fn zip_key(pack: u32, ver: u16) -> u64 {
+    (pack as u64) << 44 | (ver as u64) << 28
 }
 
 /// A pack with at least one committed version.
 struct PackEntry {
     meta: PackMeta,
     versions: BTreeMap<u16, Arc<VersionMeta>>,
-    /// The directory's mtime, which is what makes NFS clients re-read it:
-    /// when the newest version was archived, and never going backwards.
+    /// The mtime of the directory and of its `.itch-nfs-deduplicated.tsv`,
+    /// which is what makes NFS clients re-read them: when the newest version
+    /// was archived, and never going backwards.
     changed_at: i64,
 }
 
@@ -103,11 +128,11 @@ struct Tables {
 /// Lazily built data for one pack.
 #[derive(Default)]
 struct GameRt {
-    /// Trees of the pack's first versions, in version number order. Always a
-    /// prefix, because each is de-duplicated against all of its predecessors.
-    trees: RwLock<BTreeMap<u16, Arc<Tree>>>,
-    /// Everything in the versions that `trees` covers.
-    load: tokio::sync::Mutex<Seen>,
+    /// The pack's versions merged into one tree, in version number order.
+    /// Extended in place when versions are added: it only ever grows.
+    tree: RwLock<PackTree>,
+    /// Held while versions are being folded into `tree`.
+    load: tokio::sync::Mutex<()>,
 }
 
 struct Inner {
@@ -266,12 +291,14 @@ impl ItchFs {
                 {
                     // Should not happen (versions are numbered in the order
                     // they are committed), but later versions are
-                    // de-duplicated against this one: rebuild their trees.
+                    // de-duplicated against this one and named around it:
+                    // `pack_tree` rebuilds the pack's tree.
                     warn!(
-                        "{}/{} appeared with a lower number than existing versions",
+                        "{}/{} appeared with a lower number than existing versions: \
+                         files of later versions may be renamed or hidden, and their \
+                         directories get new file handles",
                         entry.meta.name, v.name
                     );
-                    self.0.games.lock().unwrap().remove(&no);
                 }
                 if announce {
                     info!("new version: {}/{}", entry.meta.name, v.name);
@@ -296,8 +323,19 @@ impl ItchFs {
         self.0.disk.copies()
     }
 
-    fn rt(&self, no: u32) -> Arc<GameRt> {
-        self.0.games.lock().unwrap().entry(no).or_default().clone()
+    /// How many packs have a tree in memory (possibly an empty one).
+    pub fn packs_loaded(&self) -> usize {
+        self.0.games.lock().unwrap().len()
+    }
+
+    /// The pack's runtime state, made on first use and kept for good: only
+    /// for a pack that is in the tables, or any handle a client makes up
+    /// would leave an entry behind.
+    fn rt(&self, no: u32) -> Result<Arc<GameRt>, nfsstat3> {
+        if !self.0.tables.read().unwrap().packs.contains_key(&no) {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+        Ok(self.0.games.lock().unwrap().entry(no).or_default().clone())
     }
 
     /// (pack directory name, version) for a pack and version number.
@@ -308,26 +346,26 @@ impl ItchFs {
         Ok((p.meta.name.clone(), v.clone()))
     }
 
-    /// The (de-duplicated) tree of a version. Loads all earlier versions first.
-    async fn tree(&self, no: u32, ver: u16) -> Result<Arc<Tree>, nfsstat3> {
-        let rt = self.rt(no);
-        if let Some(t) = rt.trees.read().unwrap().get(&ver) {
-            return Ok(t.clone());
+    /// The pack's tree, with every version the tables hold folded in.
+    async fn pack_tree(&self, no: u32) -> Result<Arc<GameRt>, nfsstat3> {
+        let rt = self.rt(no)?;
+        if self.unfolded(no, &rt)?.1.is_empty() {
+            return Ok(rt);
         }
-        let mut seen = rt.load.lock().await;
-        // Every version up to this one that has no tree yet, oldest first.
-        let (pack, todo): (String, Vec<Arc<VersionMeta>>) = {
+        let loading = rt.load.lock().await;
+        let (pack, todo) = self.unfolded(no, &rt)?;
+        // A version numbered below one that is already folded in changes
+        // what those are de-duplicated against: start again, on the side, so
+        // that requests in flight keep a complete tree.
+        let last = rt.tree.read().unwrap().folded().last().copied();
+        let mut rebuilt = None;
+        let todo = if todo.iter().any(|v| last.is_some_and(|last| v.no < last)) {
+            rebuilt = Some(PackTree::default());
             let t = self.0.tables.read().unwrap();
             let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
-            let have = rt.trees.read().unwrap();
-            (
-                p.meta.name.clone(),
-                p.versions
-                    .range(..=ver)
-                    .filter(|(n, _)| !have.contains_key(n))
-                    .map(|(_, v)| v.clone())
-                    .collect(),
-            )
+            p.versions.values().cloned().collect()
+        } else {
+            todo
         };
         for v in todo {
             let (store, name, meta) = (self.0.store.clone(), pack.clone(), v.clone());
@@ -335,15 +373,48 @@ impl ItchFs {
                 .await
                 .map_err(|e| io_err(e.into()))?
                 .map_err(io_err)?;
-            let tree = Tree::build(&manifest, &v.name, &mut seen).map_err(io_err)?;
-            rt.trees.write().unwrap().insert(v.no, Arc::new(tree));
+            let version = tree::Version {
+                no: v.no,
+                name: &v.name,
+                timestamp: v.timestamp,
+                archived_at: v.archived_at,
+            };
+            match &mut rebuilt {
+                Some(t) => t.extend(&version, &manifest),
+                None => rt.tree.write().unwrap().extend(&version, &manifest),
+            }
+            .with_context(|| format!("{pack}/{}", v.name))
+            .map_err(io_err)?;
         }
-        rt.trees
-            .read()
-            .unwrap()
-            .get(&ver)
-            .cloned()
-            .ok_or(nfsstat3::NFS3ERR_STALE)
+        if let Some(t) = rebuilt {
+            *rt.tree.write().unwrap() = t;
+        }
+        drop(loading);
+        Ok(rt)
+    }
+
+    /// (pack directory name, the versions not folded into its tree yet,
+    /// oldest first).
+    fn unfolded(&self, no: u32, rt: &GameRt) -> Result<(String, Vec<Arc<VersionMeta>>), nfsstat3> {
+        let t = self.0.tables.read().unwrap();
+        let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
+        let tree = rt.tree.read().unwrap();
+        let have = tree.folded();
+        let todo = if have.len() == p.versions.len() {
+            Vec::new() // versions are only ever added
+        } else {
+            p.versions
+                .iter()
+                .filter(|(n, _)| !have.contains(n))
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+        Ok((p.meta.name.clone(), todo))
+    }
+
+    fn changed_at(&self, no: u32) -> Result<i64, nfsstat3> {
+        let t = self.0.tables.read().unwrap();
+        Ok(t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?.changed_at)
     }
 
     /// The local copy of the file a version is served from, fetched from the
@@ -389,7 +460,7 @@ impl ItchFs {
         }
         let zip = self.zip_archive(no, ver).await?;
         let archives = self.0.archives.clone();
-        let key = Id::Version(no, ver).encode();
+        let key = zip_key(no, ver);
         let data = tokio::task::spawn_blocking(move || {
             let mut buf = Vec::with_capacity(size as usize);
             archives
@@ -424,7 +495,7 @@ impl ItchFs {
         }
         let zip = self.zip_archive(no, ver).await?;
         let archives = self.0.archives.clone();
-        let key = Id::Version(no, ver).encode();
+        let key = zip_key(no, ver);
         let out = dest.clone();
         tokio::task::spawn_blocking(move || {
             let part = out.with_extension("part");
@@ -453,59 +524,43 @@ impl ItchFs {
                     })
                     .collect())
             }
-            Id::Game(no) => {
-                let t = self.0.tables.read().unwrap();
-                let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
-                Ok(p.versions
-                    .iter()
-                    .map(|(ver, v)| {
-                        (
-                            v.name.clone(),
-                            attr(Id::Version(no, *ver).encode(), true, 0, v.timestamp),
-                        )
-                    })
-                    .collect())
-            }
-            Id::Version(no, ver) => self.list_node(no, ver, 0).await,
-            Id::Node(no, ver, n) => self.list_node(no, ver, n).await,
+            Id::Game(no) => self.list_node(no, tree::ROOT).await,
+            Id::Node(no, n) => self.list_node(no, n).await,
         }
     }
 
-    async fn list_node(
-        &self,
-        no: u32,
-        ver: u16,
-        n: u32,
-    ) -> Result<Vec<(String, fattr3)>, nfsstat3> {
-        let (_, v) = self.version(no, ver)?;
-        let tree = self.tree(no, ver).await?;
-        let node = tree.get(n).ok_or(nfsstat3::NFS3ERR_STALE)?;
-        let NodeKind::Dir { children } = &node.kind else {
-            return Err(nfsstat3::NFS3ERR_NOTDIR);
-        };
+    async fn list_node(&self, no: u32, dir: NodeId) -> Result<Vec<(String, fattr3)>, nfsstat3> {
+        let changed_at = self.changed_at(no)?;
+        let rt = self.pack_tree(no).await?;
+        let tree = rt.tree.read().unwrap();
+        if tree.get(dir).is_none() {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+        let children = tree.children(dir).ok_or(nfsstat3::NFS3ERR_NOTDIR)?;
         Ok(children
-            .iter()
-            .filter_map(|&c| {
-                tree.get(c).map(|child| {
-                    (
-                        child.name.clone(),
-                        node_attr(no, ver, c, &child.kind, v.timestamp),
-                    )
-                })
+            .into_iter()
+            .filter_map(|c| {
+                tree.get(c)
+                    .map(|child| (child.name.clone(), node_attr(no, c, child, changed_at)))
             })
             .collect())
     }
 }
 
-fn node_attr(no: u32, ver: u16, n: u32, kind: &NodeKind, version_ts: i64) -> fattr3 {
-    let id = Id::Node(no, ver, n).encode();
-    match kind {
-        NodeKind::Dir { .. } => attr(id, true, 0, version_ts),
-        NodeKind::File { size, mtime, .. } => attr(
+/// `changed_at` is the pack's.
+fn node_attr(no: u32, n: NodeId, node: &Node, changed_at: i64) -> fattr3 {
+    let id = Id::Node(no, n).encode();
+    match &node.kind {
+        NodeKind::Dir { .. } => attr(id, true, 0, node.mtime),
+        NodeKind::File { size, .. } => attr(
             id,
             false,
             *size,
-            if *mtime > 0 { *mtime } else { version_ts },
+            if n == tree::LISTING {
+                changed_at
+            } else {
+                node.mtime
+            },
         ),
     }
 }
@@ -529,13 +584,10 @@ impl NFSFileSystem for ItchFs {
         if name == ".." {
             return Ok(match dir {
                 Id::Root | Id::Game(_) => Id::Root,
-                Id::Version(g, _) => Id::Game(g),
-                Id::Node(g, v, n) => {
-                    let tree = self.tree(g, v).await?;
-                    match tree.get(n).ok_or(nfsstat3::NFS3ERR_STALE)?.parent {
-                        0 => Id::Version(g, v),
-                        p => Id::Node(g, v, p),
-                    }
+                Id::Node(g, n) => {
+                    let rt = self.pack_tree(g).await?;
+                    let tree = rt.tree.read().unwrap();
+                    Id::of(g, tree.get(n).ok_or(nfsstat3::NFS3ERR_STALE)?.parent)
                 }
             }
             .encode());
@@ -548,20 +600,19 @@ impl NFSFileSystem for ItchFs {
                     .find(|(_, p)| p.meta.name == name)
                     .map(|(no, _)| Id::Game(*no))
             }
-            Id::Game(no) => {
-                let t = self.0.tables.read().unwrap();
-                let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
-                p.versions
-                    .iter()
-                    .find(|(_, v)| v.name == name)
-                    .map(|(ver, _)| Id::Version(no, *ver))
-            }
-            Id::Version(g, v) | Id::Node(g, v, _) => {
-                let n = if let Id::Node(_, _, n) = dir { n } else { 0 };
-                self.version(g, v)?;
-                let tree = self.tree(g, v).await?;
+            Id::Game(g) | Id::Node(g, _) => {
+                let n = if let Id::Node(_, n) = dir {
+                    n
+                } else {
+                    tree::ROOT
+                };
+                let rt = self.pack_tree(g).await?;
+                let tree = rt.tree.read().unwrap();
                 match tree.get(n).ok_or(nfsstat3::NFS3ERR_STALE)?.kind {
-                    NodeKind::Dir { .. } => tree.child(n, name).map(|c| Id::Node(g, v, c)),
+                    NodeKind::Dir { .. } => tree
+                        .child(n, name)
+                        .filter(|c| tree.get(*c).is_some())
+                        .map(|c| Id::Node(g, c)),
                     NodeKind::File { .. } => return Err(nfsstat3::NFS3ERR_NOTDIR),
                 }
             }
@@ -577,12 +628,12 @@ impl NFSFileSystem for ItchFs {
                 let p = t.packs.get(&no).ok_or(nfsstat3::NFS3ERR_STALE)?;
                 Ok(attr(id, true, 0, p.changed_at))
             }
-            Id::Version(no, ver) => Ok(attr(id, true, 0, self.version(no, ver)?.1.timestamp)),
-            Id::Node(no, ver, n) => {
-                let (_, v) = self.version(no, ver)?;
-                let tree = self.tree(no, ver).await?;
+            Id::Node(no, n) => {
+                let changed_at = self.changed_at(no)?;
+                let rt = self.pack_tree(no).await?;
+                let tree = rt.tree.read().unwrap();
                 let node = tree.get(n).ok_or(nfsstat3::NFS3ERR_STALE)?;
-                Ok(node_attr(no, ver, n, &node.kind, v.timestamp))
+                Ok(node_attr(no, n, node, changed_at))
             }
         }
     }
@@ -593,19 +644,20 @@ impl NFSFileSystem for ItchFs {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let Id::Node(no, ver, n) = Id::decode(id)? else {
+        let Id::Node(no, n) = Id::decode(id)? else {
             return Err(nfsstat3::NFS3ERR_ISDIR);
         };
-        self.version(no, ver)?;
-        let tree = self.tree(no, ver).await?;
-        let node = tree.get(n).ok_or(nfsstat3::NFS3ERR_STALE)?;
-        let NodeKind::File {
-            size, crc, source, ..
-        } = &node.kind
-        else {
-            return Err(nfsstat3::NFS3ERR_ISDIR);
+        // A file is read from the version that brought it.
+        let ver = n.ver;
+        let (size, crc, source) = {
+            let rt = self.pack_tree(no).await?;
+            let tree = rt.tree.read().unwrap();
+            let node = tree.get(n).ok_or(nfsstat3::NFS3ERR_STALE)?;
+            let NodeKind::File { size, crc, source } = &node.kind else {
+                return Err(nfsstat3::NFS3ERR_ISDIR);
+            };
+            (*size, *crc, source.clone())
         };
-        let (size, crc) = (*size, *crc);
         let count = count.min(MAX_READ);
         let slice = |b: &Bytes| {
             let start = offset.min(b.len() as u64) as usize;
@@ -616,7 +668,7 @@ impl NFSFileSystem for ItchFs {
             r.map_err(|e| io_err(e.into()))?
                 .map_err(|e| io_err(e.into()))
         };
-        let data = match source {
+        let data = match &source {
             Source::Inline(b) => slice(b),
             Source::Zip(index) if size <= self.0.mem.max_bytes() => slice(
                 &self

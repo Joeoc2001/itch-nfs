@@ -11,30 +11,52 @@ An archive of every upload of every asset pack you own, and a read-only NFSv3
 export of it, laid out as
 
 ```
-/<creator>.<pack>/<version>/<contents of the archive ...>
+/<creator>.<pack>/<contents of every version, merged ...>
 ```
 
 for example
 
 ```
-/kenney.tiny-town/2024-01-05-tiny-town-v1-u123456/Tiles/tile_0001.png
-/kenney.tiny-town/2024-06-01-tiny-town-v2-u234567/Tiles/tile_0200.png
+/kenney.tiny-town/Tiles/tile_0001.png        from the first version
+/kenney.tiny-town/Tiles/tile_0001.v2.png     the second version changed it
+/kenney.tiny-town/Tiles/tile_0200.png        new in the second version
+/kenney.tiny-town/.itch-nfs-deduplicated.tsv
 ```
 
-* **Every version is its own directory, and there is no `latest`.** A version is one
-  upload on the pack's itch.io page, named `<upload date>-<file name>-u<upload id>`
-  (plus `-b<build id>` for an upload pushed with butler).
-  Names are assigned once and never change, so a path you pin keeps working.
-* **Later versions only contain what is new.** A file that is identical (same file
-  name, size and CRC-32, regardless of folder) to one in an earlier version of the
-  same pack is hidden, so the only path that works is the earliest one. Each
-  version has a `.itch-nfs-deduplicated.tsv` at its top listing what was hidden
-  and where the earliest copy is.
+* **A pack is one directory, holding every version of it.** A version is one
+  upload on the pack's itch.io page, and itch-nfs numbers a pack's versions
+  from 1 in the order it archives them. Versions are merged in that order:
+  directories are shared, and a file goes where it is in its upload.
+* **A path that works keeps working, and keeps its content.** Nothing is ever
+  renamed, replaced or removed when a version is added, so there is no
+  `latest`: the plain path is always the *oldest* content.
+* **A changed file is served next to the original.** If an earlier version
+  already has other content at a path, the newer file gets its version number
+  before its type suffix: `tile.v2.png`, `sfx.v2.tar.gz` (archive extensions
+  are kept whole), and `LICENSE.v2` or `.gitignore.v2` for a name with no
+  suffix. The same goes for a directory and a file of one name. If an upload
+  really contains a `tile.v2.png`, the clashing file becomes `tile.v2-2.png`.
+  "The current file" is therefore the one with the highest number.
+* **An unchanged file is served once.** A file that is identical (same file
+  name, size and CRC-32, regardless of folder) to one in an earlier version of
+  the same pack is not served again, so the only path that works is the
+  earliest one. A version re-zipped under another top-level folder
+  (`tiny-v2/` after `tiny/`) therefore adds a folder holding only what
+  changed.
+* **Separate uploads of one pack are versions too**, so `Pack-PNG.zip` and
+  `Pack-SVG.zip` on one page land in the same directory, and a `README.txt`
+  in each makes the second `README.v2.txt`.
+* **`.itch-nfs-deduplicated.tsv`**, at the top of every pack, lists every
+  file that is not served at the path it has in its upload, tab-separated:
+  the version (its name in the archive, `<upload date>-<file name>-u<upload
+  id>`), the path in the upload, the path it is served at, and `renamed`
+  (tagged as above) or `duplicate` (not served; the path is the earliest
+  copy's).
 * **Archives are unpacked, recursively.** Uploads in zip, 7z, rar, tar, tar.gz,
   tar.bz2, tar.xz or tar.zst form (and the short spellings: `.tgz`, `.tbz2`,
   `.tbz`, `.txz`, `.tzst`) are exposed as their contents. An archive
   *inside* an upload becomes a directory named after it, up to 8 levels deep:
-  `Pack.zip` containing `sfx.tar.gz` shows up as `<version>/sfx.tar.gz/boom.ogg`.
+  `Pack.zip` containing `sfx.tar.gz` shows up as `<pack>/sfx.tar.gz/boom.ogg`.
 * Only files with an archive extension are opened, so archives in disguise
   (`.unitypackage`, `.jar`, `.love`, ...) stay whole. Anything that is not an
   archive, or cannot be opened (corrupt, password-protected), is exposed as the
@@ -85,9 +107,9 @@ depends on itch.io still having it.
     version.json                 written last: the commit marker
 ```
 
-It describes itself: the directory names are the exported names, and
-`pack.json` and `version.json` carry the numbers NFS file handles are made
-from. Losing every other directory loses nothing — paths, handles and contents
+It describes itself: the pack directory names are the exported names, the
+listings say what each version holds, and `pack.json` and `version.json`
+carry the numbers that NFS file handles and the `.v<n>` tags are made from. Losing every other directory loses nothing — paths, handles and contents
 are the same after a restart on the archive alone.
 
 `version.json` records the upload (id, build, file name, size, timestamp), how
@@ -259,9 +281,10 @@ docker run --rm -e ITCH_TOKEN=... \
 API flags of `scan`; `--state-dir` and `--old-archive-dir` can be given as
 `ITCH_NFS_STATE_DIR` and `ITCH_NFS_OLD_ARCHIVE_DIR`.
 
-Every pack and version keeps its name and number, so pinned paths and NFS
-file handles stay valid. The old directories are only read; delete them once
-you are happy. Things to know:
+Every pack and version keeps its name and number, so the NFS file handles of
+files stay valid (paths changed later: see
+[below](#upgrading-from-one-directory-per-version)). The old directories are
+only read; delete them once you are happy. Things to know:
 
 * The old server threw away the original of any upload it had to flatten, so
   those versions are imported with `content.zip` only, and `version.json`
@@ -278,6 +301,17 @@ you are happy. Things to know:
   once and exits with an error, and the version it was working on is redone.
   It refuses an archive that a scanner has already numbered differently, so
   migrate before the first scan.
+
+### Upgrading from one directory per version
+
+The export used to be `/<pack>/<version>/<contents>`, each version showing
+only what was new in it. Every version of a pack is now merged into the pack
+directory, so **every path changes** (drop the version segment; a file whose
+path an earlier version had taken with other content is now `name.v<n>.ext`)
+and there is no longer a view of one version alone. The archive is the same
+and needs no migration: upgrade `serve`, then **remount the clients**. File
+handles of files are unchanged; those of the old version directories are
+stale.
 
 ## Mounting
 
@@ -322,8 +356,11 @@ keeps three things in `--cache-dir` and in memory so that it rarely has to:
   exceeded. A single file larger than the whole budget is extracted to
   `<cache-dir>/spill` instead.
 
-Opening a version needs the listings of every earlier version of that pack
-(for de-duplication), which is metadata only.
+Opening a pack needs the listings of every version of that pack (to merge
+and de-duplicate them), which is metadata only: one read of the archive per
+version, once per cache directory. If a listing cannot be read, the whole
+pack fails with an I/O error until it can, rather than being served with a
+version missing.
 
 The cache directory belongs to one archive: if you point either program at a
 different archive, give it an empty cache directory.
@@ -358,8 +395,10 @@ mount with `ci/validate.py`:
   truncation or second write to a file in the archive;
 * **against itch.io**, using the `ITCH_TOKEN` repository secret. It uses
   `scan --list` to find the pack that is the smallest download, archives it
-  with `scan --only`, reads every file of every version, and checks that
-  nothing is duplicated between versions and nothing is writable. Set the
+  with `scan --only`, reads every file of the pack, and checks that every
+  file of every version in the archive is served exactly once (at its own
+  path, tagged, or not at all if an earlier version has the same file) and
+  that nothing is writable. Set the
   repository variable `ITCH_NFS_CI_PACK` to a pack directory name to pin which
   pack is used. Pack names are kept out of the logs unless the variable
   `ITCH_NFS_CI_SHOW_NAMES` is `1`.
