@@ -702,6 +702,56 @@ async fn a_pack_with_an_unreadable_listing_fails_until_it_can_be_read() {
     assert_eq!(cat(&mut c, "creator.tiny-pack/a.v2.png").await, b"AAAA");
 }
 
+/// The export is unauthenticated and a handle is just a file id, so a client
+/// can name any of the 2^20 pack numbers: none may cost the server memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handle_of_an_unknown_pack_is_stale_and_leaves_nothing_behind() {
+    let mock = Arc::new(Mock::default());
+    mock.uploads.lock().unwrap().insert(
+        1,
+        MockUpload::new("One.zip", "2024-01-05", zip_of(&[("a.png", b"aaaa")])),
+    );
+    let addr = support::spawn(mock.clone()).await;
+    let (archive, cache) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    scanner(addr, scan_config(archive.path(), cache.path()))
+        .pass()
+        .await
+        .unwrap();
+    let (fs, mut c) = serve(archive.path(), cache.path()).await;
+    assert_eq!(ls(&mut c, "/").await, ["creator.tiny-pack"]);
+    assert_eq!(fs.packs_loaded(), 0);
+
+    // Pack 1 exists; packs 2 and 0xfffff do not.
+    for no in [2, 0xfffff] {
+        let (dir, file) = (handle(no, 0, 0), handle(no, 1, 1));
+        assert_eq!(
+            lookup(&mut c, &dir, "a.png").await.unwrap_err(),
+            nfsstat3::NFS3ERR_STALE
+        );
+        assert_eq!(
+            lookup(&mut c, &file, "a.png").await.unwrap_err(),
+            nfsstat3::NFS3ERR_STALE
+        );
+        assert_eq!(
+            lookup(&mut c, &file, "..").await.unwrap_err(),
+            nfsstat3::NFS3ERR_STALE
+        );
+        assert_eq!(
+            read_fh(&mut c, &file).await.unwrap_err(),
+            nfsstat3::NFS3ERR_STALE
+        );
+        assert_eq!(
+            getattr(&mut c, &file).await.unwrap_err(),
+            nfsstat3::NFS3ERR_STALE
+        );
+    }
+    assert_eq!(fs.packs_loaded(), 0);
+
+    // The pack that exists is loaded, once.
+    assert_eq!(cat(&mut c, "creator.tiny-pack/a.png").await, b"aaaa");
+    assert_eq!(fs.packs_loaded(), 1);
+}
+
 /// Packs appear once they have a committed version, each under its own
 /// stable number, and a version being written is not served.
 #[tokio::test(flavor = "multi_thread")]

@@ -323,8 +323,19 @@ impl ItchFs {
         self.0.disk.copies()
     }
 
-    fn rt(&self, no: u32) -> Arc<GameRt> {
-        self.0.games.lock().unwrap().entry(no).or_default().clone()
+    /// How many packs have a tree in memory (possibly an empty one).
+    pub fn packs_loaded(&self) -> usize {
+        self.0.games.lock().unwrap().len()
+    }
+
+    /// The pack's runtime state, made on first use and kept for good: only
+    /// for a pack that is in the tables, or any handle a client makes up
+    /// would leave an entry behind.
+    fn rt(&self, no: u32) -> Result<Arc<GameRt>, nfsstat3> {
+        if !self.0.tables.read().unwrap().packs.contains_key(&no) {
+            return Err(nfsstat3::NFS3ERR_STALE);
+        }
+        Ok(self.0.games.lock().unwrap().entry(no).or_default().clone())
     }
 
     /// (pack directory name, version) for a pack and version number.
@@ -337,7 +348,7 @@ impl ItchFs {
 
     /// The pack's tree, with every version the tables hold folded in.
     async fn pack_tree(&self, no: u32) -> Result<Arc<GameRt>, nfsstat3> {
-        let rt = self.rt(no);
+        let rt = self.rt(no)?;
         if self.unfolded(no, &rt)?.1.is_empty() {
             return Ok(rt);
         }
