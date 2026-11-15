@@ -97,14 +97,17 @@ def check_against_archive(label, versions, served, rows):
     seen = set()  # (file name, size, crc) of every file of the earlier versions
     taken = {}  # served path -> the version it came from
     for no, version, entries in versions:
-        fresh, paths = set(), set()
+        fresh, paths, dirs = set(), set(), set()
         for path, size, crc in entries:
-            # Within one version, a path that repeats, or that runs through
-            # a file, cannot exist: the first entry wins.
+            # Within one version, a path that repeats (as a file or as a
+            # directory of an earlier entry), or that runs through a file,
+            # cannot exist: the first entry wins.
             parts = path.split("/")
-            if path in paths or any("/".join(parts[:i]) in paths for i in range(1, len(parts))):
+            above = ["/".join(parts[:i]) for i in range(1, len(parts))]
+            if path in paths or path in dirs or any(d in paths for d in above):
                 continue
             paths.add(path)
+            dirs.update(above)
             key = (parts[-1], size, crc)
             row = rows.pop((version, path), None)
             if key in seen:
