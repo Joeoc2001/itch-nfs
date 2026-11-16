@@ -51,7 +51,7 @@ pub struct PackMeta {
     pub name: String,
     #[serde(default)]
     pub title: String,
-    /// The pack's itch.io page. Empty for packs imported by `migrate`.
+    /// The pack's itch.io page, if known.
     #[serde(default)]
     pub url: String,
 }
@@ -89,8 +89,7 @@ pub struct VersionMeta {
     pub kind: Kind,
     /// The file the frontend serves from: `content.zip`, or the upload itself.
     pub serve: String,
-    /// The original upload. `None` only for versions imported by `migrate`
-    /// that had already been flattened, when the original was not kept.
+    /// The original upload, if it was kept.
     pub upload: Option<String>,
     /// Every file of the version except this one, with checksums.
     pub files: Vec<FileMeta>,
@@ -522,7 +521,7 @@ impl Store {
         Ok(versions)
     }
 
-    // ---- writing (scanner and migrate only) ----
+    // ---- writing (scanner only) ----
 
     /// Every committed version in a pack directory, for the writer: either
     /// all of them or an error. [`Store::versions`] leaves out what it cannot

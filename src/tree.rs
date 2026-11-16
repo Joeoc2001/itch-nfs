@@ -965,7 +965,7 @@ mod tests {
             assert!(t.extend(&v, &m).is_err());
         }
         assert_eq!(files(&t), ["a", "b"], "a refused version changes nothing");
-        // Gaps are fine: `migrate` can leave them.
+        // Gaps are fine.
         fold(&mut t, 7, &[("a", 2, 9)]);
         assert_eq!(files(&t), ["a", "a.v7", "b"]);
     }
