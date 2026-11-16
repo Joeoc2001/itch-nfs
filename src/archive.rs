@@ -14,12 +14,8 @@ use zip::ZipArchive;
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     /// An archive (flattened to a zip if need be), exposed as its contents.
-    // The aliases are how manifests written before the archive directory
-    // existed spell it; `migrate` reads those.
-    #[serde(alias = "Zip")]
     Zip,
     /// Anything else, exposed as the single downloaded file.
-    #[serde(alias = "Raw")]
     Raw,
 }
 
@@ -257,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn kind_is_written_lower_case_and_read_either_way() {
+    fn kind_is_written_lower_case() {
         let m = Manifest {
             kind: Kind::Zip,
             entries: Vec::new(),
@@ -266,10 +262,5 @@ mod tests {
             serde_json::to_string(&m).unwrap(),
             r#"{"kind":"zip","entries":[]}"#
         );
-        // As written before the archive directory existed.
-        let old: Manifest = serde_json::from_str(r#"{"kind":"Raw","entries":[]}"#).unwrap();
-        assert_eq!(old.kind, Kind::Raw);
-        let old: Manifest = serde_json::from_str(r#"{"kind":"Zip","entries":[]}"#).unwrap();
-        assert_eq!(old.kind, Kind::Zip);
     }
 }

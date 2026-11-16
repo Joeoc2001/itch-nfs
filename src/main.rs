@@ -5,7 +5,6 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use itch_nfs::fs::{Config, ItchFs};
 use itch_nfs::itch::{DEFAULT_API_URL, ItchClient};
-use itch_nfs::migrate::{MigrateConfig, legacy_deployment, migrate};
 use itch_nfs::scan::{ScanConfig, Scanner};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
@@ -27,8 +26,6 @@ enum Command {
     /// The frontend: serve the archive over NFS. Needs no token, never talks
     /// to itch.io, and only reads the archive.
     Serve(ServeArgs),
-    /// Import a deployment from before the archive directory existed.
-    Migrate(MigrateArgs),
 }
 
 #[derive(Args)]
@@ -59,24 +56,6 @@ impl Dirs {
             None => private_temp_dir(),
         }
     }
-
-    /// The cache directory, after refusing to start on top of an unmigrated
-    /// deployment: `--archive-dir` used to mean a disposable download cache,
-    /// and the history lived in `--state-dir`.
-    fn checked(&self) -> Result<PathBuf> {
-        let cache_dir = self.cache_dir()?;
-        let old_state_dir = std::env::var_os("ITCH_NFS_STATE_DIR").map(PathBuf::from);
-        if let Some(why) =
-            legacy_deployment(&self.archive_dir, &cache_dir, old_state_dir.as_deref())
-        {
-            bail!(
-                "this looks like a deployment from before the archive directory existed ({why}). \
-                 Import it with `itch-nfs migrate` first, or move the old files away to start afresh; \
-                 see the README"
-            );
-        }
-        Ok(cache_dir)
-    }
 }
 
 #[derive(Args)]
@@ -99,29 +78,24 @@ struct Itch {
 }
 
 impl Itch {
-    fn token(&self) -> Result<Option<String>> {
+    fn token(&self) -> Result<String> {
         let token = match (&self.token, &self.token_file) {
             (Some(t), _) => t.clone(),
             (None, Some(f)) => {
                 std::fs::read_to_string(f).with_context(|| format!("read {}", f.display()))?
             }
-            (None, None) => return Ok(None),
+            (None, None) => bail!("no itch.io token: set ITCH_TOKEN or pass --token-file"),
         };
         let token = token.trim().to_string();
         if token.is_empty() {
             bail!("the itch.io token is empty");
         }
-        Ok(Some(token))
+        Ok(token)
     }
 
-    fn client(&self) -> Result<Option<ItchClient>> {
-        let Some(token) = self.token()? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            ItchClient::new(&self.api_url, token)?
-                .with_delay(Duration::from_millis(self.api_delay_ms)),
-        ))
+    fn client(&self) -> Result<ItchClient> {
+        Ok(ItchClient::new(&self.api_url, self.token()?)?
+            .with_delay(Duration::from_millis(self.api_delay_ms)))
     }
 }
 
@@ -193,30 +167,6 @@ struct ServeArgs {
     rescan_interval: u64,
 }
 
-#[derive(Args)]
-struct MigrateArgs {
-    /// The old --state-dir: the directory holding state.json.
-    #[arg(long, env = "ITCH_NFS_STATE_DIR")]
-    state_dir: PathBuf,
-
-    /// The old --archive-dir: the directory holding the downloaded
-    /// `<game id>-<version>.zip` files.
-    #[arg(long, env = "ITCH_NFS_OLD_ARCHIVE_DIR")]
-    old_archive_dir: PathBuf,
-
-    #[command(flatten)]
-    dirs: Dirs,
-
-    /// Optional here: with a token, versions the old server listed but never
-    /// downloaded are fetched if itch.io still serves them.
-    #[command(flatten)]
-    itch: Itch,
-
-    /// As for `scan`.
-    #[arg(long, env = "ITCH_NFS_MAX_UNPACKED_GB", default_value_t = 100)]
-    max_unpacked_gb: u64,
-}
-
 fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("start the async runtime")?;
     let result = runtime.block_on(run());
@@ -239,16 +189,13 @@ async fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Scan(args) => run_scan(args).await,
         Command::Serve(args) => run_serve(args).await,
-        Command::Migrate(args) => run_migrate(args).await,
     }
 }
 
 async fn run_scan(args: ScanArgs) -> Result<()> {
-    let Some(client) = args.itch.client()? else {
-        bail!("no itch.io token: set ITCH_TOKEN or pass --token-file");
-    };
+    let client = args.itch.client()?;
     let cfg = ScanConfig {
-        cache_dir: args.dirs.checked()?,
+        cache_dir: args.dirs.cache_dir()?,
         archive_dir: args.dirs.archive_dir,
         max_unpacked_bytes: args.max_unpacked_gb.saturating_mul(1 << 30),
         only: args.only,
@@ -333,7 +280,7 @@ async fn run_scan(args: ScanArgs) -> Result<()> {
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
     let cfg = Config {
-        cache_dir: args.dirs.checked()?,
+        cache_dir: args.dirs.cache_dir()?,
         archive_dir: args.dirs.archive_dir,
         cache_max_bytes: args.cache_max_mb.saturating_mul(1024 * 1024),
         cache_ttl: Duration::from_secs(args.cache_ttl),
@@ -351,39 +298,6 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         served = listener.handle_forever() => served?,
         _ = shutdown.recv() => tracing::info!("shutting down"),
     }
-    Ok(())
-}
-
-async fn run_migrate(args: MigrateArgs) -> Result<()> {
-    let client = args.itch.client()?;
-    let cfg = MigrateConfig {
-        state_dir: args.state_dir,
-        old_archive_dir: args.old_archive_dir,
-        cache_dir: args.dirs.cache_dir()?,
-        archive_dir: args.dirs.archive_dir,
-        max_unpacked_bytes: args.max_unpacked_gb.saturating_mul(1 << 30),
-    };
-    if client.is_none() {
-        tracing::info!("no itch.io token: versions that were never downloaded stay missing");
-    }
-    let mut shutdown = Shutdown::new()?;
-    // On a task of its own: importing blocks the task it runs on, which
-    // would otherwise not get to look at the signal until it is done.
-    let work = tokio::spawn(async move { migrate(&cfg, client.as_ref()).await });
-    // Stopping half way is safe: a version without its commit marker is
-    // redone, and what is committed is left alone when migrate is run again.
-    let report = tokio::select! {
-        report = work => report.context("migrate task")??,
-        _ = shutdown.recv() => bail!("interrupted before the migration finished; run migrate again to carry on"),
-    };
-    tracing::info!(
-        "{} pack(s): {} version(s) imported, {} fetched, {} already in the archive, {} missing",
-        report.packs,
-        report.imported.len(),
-        report.fetched.len(),
-        report.already,
-        report.gaps.len()
-    );
     Ok(())
 }
 

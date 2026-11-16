@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::archive::{self, Kind};
 use crate::ingest::{self, Limits, Outcome};
 use crate::itch::{ItchClient, OwnedGame, Upload};
-use crate::state;
+use crate::naming;
 use crate::store::{
     AlreadyCommitted, CONTENT_FILE, MANIFEST_FILE, MAX_PACKS, NumberTaken, PackMeta, Store,
     UPLOAD_DIR, VersionMeta, safe_file_name,
@@ -110,17 +110,17 @@ impl VersionPlan {
             fingerprint: fingerprint(u),
             filename: u.filename.clone(),
             size: u.size,
-            timestamp: state::parse_ts(u.updated_at.as_deref())
-                .or(state::parse_ts(u.created_at.as_deref()))
+            timestamp: naming::parse_ts(u.updated_at.as_deref())
+                .or(naming::parse_ts(u.created_at.as_deref()))
                 .unwrap_or_else(now_secs),
         }
     }
 }
 
-/// The version directory name for an upload: today's naming, made unique
+/// The version directory name for an upload, made unique
 /// among `taken`.
 pub fn unique_version_name(plan: &VersionPlan, taken: &[String]) -> String {
-    let base = state::version_dir_name(
+    let base = naming::version_dir_name(
         plan.timestamp,
         &plan.filename,
         plan.upload_id,
@@ -423,7 +423,7 @@ impl Scanner {
             let name = match meta {
                 Some(p) => p.name.clone(),
                 None => {
-                    let mut name = state::game_dir_name(&game.url, game.game_id);
+                    let mut name = naming::game_dir_name(&game.url, game.game_id);
                     if names.contains(&name) {
                         name = format!("{name}-{}", game.game_id);
                     }
