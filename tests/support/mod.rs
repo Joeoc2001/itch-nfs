@@ -17,9 +17,13 @@ pub type Files<'a> = &'a [(&'a str, &'a [u8])];
 
 pub fn zip_of(files: Files) -> Vec<u8> {
     let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    // A fixed timestamp, as in `tar_of`: by default an entry is stamped with
+    // the current time, so two builds of a fixture could differ in content
+    // and, once compressed again, in size.
+    let options =
+        zip::write::SimpleFileOptions::default().last_modified_time(zip::DateTime::default());
     for (name, data) in files {
-        w.start_file(*name, zip::write::SimpleFileOptions::default())
-            .unwrap();
+        w.start_file(*name, options).unwrap();
         w.write_all(data).unwrap();
     }
     w.finish().unwrap().into_inner()
